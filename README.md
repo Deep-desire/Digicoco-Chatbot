@@ -3,7 +3,7 @@
 Embeddable conversational widget with text + voice, powered by RAG.
 
 - Frontend: React + TypeScript widget in `frontend/`
-- Backend: FastAPI + LangChain + Gemini + Pinecone + Groq + Edge TTS in `backend/`
+- Backend: FastAPI + LangChain + Azure OpenAI + Pinecone + Groq (voice STT) + Edge TTS in `backend/`
 
 ## Documentation Index
 

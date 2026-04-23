@@ -1,3 +1,118 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+:root {
+	--vtl-primary: #0f4fc0;
+	--vtl-secondary: #2a67d1;
+	--vtl-accent: #7ea9ff;
+	--vtl-text: #14213d;
+	--vtl-muted: #5b6b84;
+	--vtl-panel: #ffffff;
+	--vtl-surface: #f4f8ff;
+	--vtl-border: #d8e4f8;
+	--vtl-chip-bg: #e9f0ff;
+	--vtl-chip-hover: #d9e6ff;
+	--vtl-gradient: linear-gradient(135deg, #3b86f1 0%, #2566d0 55%, #1c4fb0 100%);
+}
+
+html,
+body,
+#root {
+	width: 100%;
+	height: 100%;
+	margin: 0;
+}
+
+body {
+	overflow-x: hidden;
+}
+
+.vtl-brand-gradient {
+	background-image: var(--vtl-gradient);
+}
+
+.vtl-markdown {
+	word-break: break-word;
+	overflow-wrap: anywhere;
+	line-height: 1.5;
+}
+
+.vtl-markdown > *:first-child {
+	margin-top: 0;
+}
+
+.vtl-markdown > *:last-child {
+	margin-bottom: 0;
+}
+
+.vtl-markdown p,
+.vtl-markdown ul,
+.vtl-markdown ol,
+.vtl-markdown blockquote,
+.vtl-markdown pre,
+.vtl-markdown table {
+	margin: 0 0 0.6rem;
+}
+
+.vtl-markdown ul,
+.vtl-markdown ol {
+	padding-left: 1.2rem;
+}
+
+.vtl-markdown ul {
+	list-style: disc;
+}
+
+.vtl-markdown ol {
+	list-style: decimal;
+}
+
+.vtl-markdown li + li {
+	margin-top: 0.2rem;
+}
+
+.vtl-markdown a {
+	color: var(--vtl-primary);
+	text-decoration: underline;
+}
+
+.vtl-markdown code {
+	font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace;
+	font-size: 0.85em;
+	background: #ebf2ff;
+	border-radius: 0.3rem;
+	padding: 0.1rem 0.3rem;
+}
+
+.vtl-markdown pre {
+	background: #111827;
+	color: #f9fafb;
+	border-radius: 0.55rem;
+	padding: 0.7rem;
+	overflow-x: auto;
+}
+
+.vtl-markdown pre code {
+	background: transparent;
+	color: inherit;
+	padding: 0;
+}
+
+.vtl-markdown blockquote {
+	border-left: 3px solid var(--vtl-secondary);
+	padding-left: 0.7rem;
+	color: var(--vtl-muted);
+}
+
+.vtl-markdown table {
+	border-collapse: collapse;
+	width: 100%;
+}
+
+.vtl-markdown th,
+.vtl-markdown td {
+	border: 1px solid var(--vtl-border);
+	padding: 0.3rem 0.45rem;
+	text-align: left;
+}

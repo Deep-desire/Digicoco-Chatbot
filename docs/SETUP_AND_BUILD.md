@@ -5,12 +5,12 @@
 - Python 3.11+
 - Node.js 18+ and npm
 - API keys:
-  - Google API key
+  - Azure OpenAI API key
   - Pinecone API key
-  - Groq API key
+  - Groq API key (voice transcription)
 - A Pinecone serverless index configured as:
   - Name: `chatbot-rag` (or your custom value)
-  - Dimension: `768`
+  - Dimension: `1536` (for `text-embedding-3-small`)
   - Metric: `cosine`
 
 ## 2) Backend Setup (Windows PowerShell)
@@ -26,9 +26,14 @@ Copy-Item .env.example .env
 Set values in `backend/.env`:
 
 ```env
-GOOGLE_API_KEY="your_google_api_key_here"
-GOOGLE_EMBEDDING_MODEL=""
-GOOGLE_CHAT_MODEL=""
+AZURE_OPENAI_ENDPOINT="https://thomaschat.cognitiveservices.azure.com/"
+AZURE_OPENAI_API_KEY="your_azure_openai_api_key_here"
+AZURE_OPENAI_API_VERSION="2024-12-01-preview"
+AZURE_OPENAI_CHAT_DEPLOYMENT="gpt-4o"
+AZURE_OPENAI_EMBEDDING_DEPLOYMENT="text-embedding-3-small"
+AZURE_OPENAI_TEMPERATURE="0.1"
+LLM_MAX_OUTPUT_TOKENS="1200"
+AZURE_OPENAI_MAX_COMPLETION_TOKENS="16384"
 PINECONE_API_KEY="your_pinecone_api_key_here"
 GROQ_API_KEY="your_groq_api_key_here"
 GROQ_TRANSCRIPTION_MODEL="whisper-large-v3"
@@ -37,7 +42,7 @@ PINECONE_INDEX_NAME="chatbot-rag"
 AUTO_CREATE_PINECONE_INDEX="false"
 PINECONE_CLOUD="aws"
 PINECONE_REGION="us-east-1"
-PINECONE_DIMENSION="768"
+PINECONE_DIMENSION="1536"
 PINECONE_METRIC="cosine"
 ENABLE_SHAREPOINT_SYNC="false"
 SHAREPOINT_TENANT_ID="your_tenant_id"
@@ -50,9 +55,6 @@ SHAREPOINT_FIELD_NAME="Name"
 SHAREPOINT_FIELD_EMAIL="email"
 SHAREPOINT_FIELD_CONVERSATION="Conversation"
 ```
-
-`GOOGLE_EMBEDDING_MODEL` is optional. If empty, the backend auto-detects a supported embedding model from your Google account.
-`GOOGLE_CHAT_MODEL` is optional. If empty, the backend auto-detects a supported chat model from your Google account.
 
 ### SharePoint list sync (optional)
 
@@ -151,9 +153,9 @@ If voice fails, verify browser microphone permissions and backend env keys.
 
 ## 6) Troubleshooting Common Startup Errors
 
-### Error: `Client.__init__() got an unexpected keyword argument 'proxies'`
+### Error: dependency import/version issues
 
-Cause: incompatible `httpx` version with `groq` SDK.
+Cause: your virtual environment is stale after dependency changes.
 
 Fix:
 
@@ -162,15 +164,13 @@ cd backend
 .\venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-This project pins `httpx==0.27.2` to avoid this issue.
-
 ### Error: `pinecone ... NotFoundException: Resource chatbot-rag not found`
 
 Cause: the Pinecone index in `PINECONE_INDEX_NAME` does not exist in your account/project.
 
 Fix:
 
-- Create the index in Pinecone (dimension `768`, metric `cosine`), or
+- Create the index in Pinecone with dimension matching your embedding deployment (for example `1536` for `text-embedding-3-small`), or
 - Update `PINECONE_INDEX_NAME` in `backend/.env` to an existing index name.
 
 Alternative auto-fix:
@@ -179,20 +179,19 @@ Alternative auto-fix:
 - Ensure `PINECONE_CLOUD` and `PINECONE_REGION` are correct for your Pinecone environment
 - Restart backend
 
-### Error: `models/text-embedding-004 is not found`
+### Error: Azure OpenAI deployment not found (404/400)
 
-Cause: your Google API key/project does not expose that embedding model in the currently used API path.
+Cause: deployment name in env does not match your Azure OpenAI deployment name.
 
 Fix:
 
-- Set `GOOGLE_EMBEDDING_MODEL` in `backend/.env` to a model available in your account, or leave it empty for auto-detection
-- Re-run ingestion (`python ingest.py`) so vectors are generated with the same embedding model
+- Verify `AZURE_OPENAI_CHAT_DEPLOYMENT` and `AZURE_OPENAI_EMBEDDING_DEPLOYMENT`
+- Ensure the deployments exist in your Azure OpenAI resource
+- Re-run ingestion (`python ingest.py`) so vectors are generated with the configured embedding deployment
 
 ### Voice endpoint returns 500
 
-If the response detail mentions Groq model issues:
-
-- Set `GROQ_TRANSCRIPTION_MODEL="whisper-large-v3-turbo"` in `backend/.env`
+If transcription fails, verify `GROQ_API_KEY` and `GROQ_TRANSCRIPTION_MODEL`.
 
 If the response detail mentions Edge TTS voice issues:
 

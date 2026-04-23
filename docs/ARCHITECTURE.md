@@ -22,8 +22,8 @@ It is split into two deployable services:
 ### Backend
 - FastAPI for API endpoints
 - LangChain for retrieval chain orchestration
-- Google Gemini (`gemini-1.5-flash`) for generation
-- Google embeddings (`models/text-embedding-004`) for vectorization
+- Azure OpenAI chat deployment (`gpt-4o`) for generation
+- Azure OpenAI embeddings deployment (`text-embedding-3-small`) for vectorization
 - Pinecone (serverless index) as vector database
 - Groq Whisper (`whisper-large-v3`) for speech-to-text
 - Edge TTS (`en-US-AriaNeural`) for text-to-speech
@@ -34,27 +34,31 @@ It is split into two deployable services:
 
 1. `backend/ingest.py` reads `backend/data.txt`
 2. Text is chunked (size 1000, overlap 100)
-3. Chunks are embedded with Google embeddings
+3. Chunks are embedded with Azure OpenAI embeddings
 4. Vectors are upserted into Pinecone index (`PINECONE_INDEX_NAME`)
 
 ### 3.2 Text Chat Runtime Flow
 
 1. Frontend sends `POST /api/chat/text` with form field `query`
 2. Backend retriever gets top-k documents from Pinecone (`k=3`)
-3. Prompt + context sent to Gemini
+3. Prompt + context sent to Azure OpenAI chat deployment
 4. Backend returns JSON: `{ "reply": "..." }`
 
 ### 3.3 Voice Chat Runtime Flow
 
 1. Frontend captures microphone audio in `audio/webm`
 2. Frontend sends `POST /api/chat/voice` with form field `audio`
-3. Backend saves temporary input file
-4. Groq Whisper transcribes audio to text
+3. Groq Whisper transcribes audio to text
 5. Backend runs RAG with transcript
 6. Edge TTS synthesizes MP3 response
-7. Backend streams MP3 back and sets headers:
+7. Backend streams MP3 back and sets metadata headers:
+  - `X-Session-Id`
    - `X-User-Query`
    - `X-Bot-Reply`
+  - `X-User-Query-Encoded`
+  - `X-Bot-Reply-Encoded`
+8. Frontend optionally calls `GET /api/chat/last?session_id=...` to fetch full-fidelity text turn data
+9. Frontend calls `GET /api/chat/suggestions?session_id=...` to refresh contextual follow-up question chips
 
 ## 4. API Surface
 
@@ -66,14 +70,23 @@ It is split into two deployable services:
 - `POST /api/chat/voice`
   - Form: `audio` file
   - Returns: `audio/mpeg` stream + transcript headers
+- `GET /api/chat/last`
+  - Query: `session_id`
+  - Returns: latest user query + assistant reply for that session
+- `GET /api/chat/suggestions`
+  - Query: `session_id`, optional `limit`
+  - Returns: context-aware follow-up questions for UI suggestions
 
 ## 5. Environment Variables
 
 Backend variables (`backend/.env`):
 
-- `GOOGLE_API_KEY`
-- `PINECONE_API_KEY`
+- `AZURE_OPENAI_ENDPOINT`
+- `AZURE_OPENAI_API_KEY`
+- `AZURE_OPENAI_CHAT_DEPLOYMENT`
+- `AZURE_OPENAI_EMBEDDING_DEPLOYMENT`
 - `GROQ_API_KEY`
+- `PINECONE_API_KEY`
 - `PINECONE_INDEX_NAME` (for example `chatbot-rag`)
 
 Frontend variable (`frontend/.env`):
@@ -95,9 +108,9 @@ sequenceDiagram
     participant U as User
     participant F as Frontend Widget (React)
     participant B as Backend API (FastAPI)
-    participant G as Groq Whisper
+  participant G as Groq Whisper
+  participant A as Azure OpenAI
     participant P as Pinecone
-    participant L as Gemini LLM
     participant T as Edge TTS
 
     alt Text Chat
@@ -105,8 +118,8 @@ sequenceDiagram
         F->>B: POST /api/chat/text (query)
         B->>P: Retrieve top-k context
         P-->>B: Context docs
-        B->>L: Prompt + context + query
-        L-->>B: Answer
+        B->>A: Prompt + context + query
+        A-->>B: Answer
         B-->>F: JSON reply
         F-->>U: Render bot response
     else Voice Chat
@@ -116,8 +129,8 @@ sequenceDiagram
         G-->>B: Transcript
         B->>P: Retrieve top-k context
         P-->>B: Context docs
-        B->>L: Prompt + context + transcript
-        L-->>B: Answer text
+        B->>A: Prompt + context + transcript
+        A-->>B: Answer text
         B->>T: Synthesize speech
         T-->>B: MP3
         B-->>F: MP3 stream + response headers
@@ -129,5 +142,5 @@ sequenceDiagram
 
 - CORS is currently permissive (`allow_origins=["*"]`) for development.
 - Restrict origins before production rollout.
-- Pinecone index must match embedding dimension (`768`) and cosine metric.
+- Pinecone index must match embedding dimension (for example `1536` for `text-embedding-3-small`) and cosine metric.
 - The backend removes temporary uploaded input files and schedules output cleanup after response.

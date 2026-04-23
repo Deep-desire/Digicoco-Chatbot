@@ -3,6 +3,7 @@ import re
 import shutil
 import uuid
 import logging
+import json
 from datetime import datetime, timezone
 from collections import deque
 from functools import lru_cache
@@ -10,20 +11,22 @@ from pathlib import Path
 from threading import Lock
 from time import sleep
 from time import time
+from typing import AsyncGenerator, Iterable
+from urllib.parse import quote
 
 import edge_tts
-import google.generativeai as genai
-import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from groq import Groq
 from ingestion import ingest_file
 from langchain.chains import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
+from openai import AsyncAzureOpenAI, AzureOpenAI
+
 from langchain_pinecone import PineconeVectorStore
 from pinecone import Pinecone, ServerlessSpec
 from pinecone.core.client.exceptions import NotFoundException
@@ -39,24 +42,30 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-User-Query", "X-Bot-Reply"],
+    expose_headers=[
+        "X-Session-Id",
+        "X-User-Query",
+        "X-Bot-Reply",
+        "X-User-Query-Encoded",
+        "X-Bot-Reply-Encoded",
+    ],
 )
 
 SUPPORTED_INGEST_EXTENSIONS = {".pdf", ".txt", ".md", ".csv", ".log"}
 
 SERVICE_SUMMARY = (
-    "Desire Infoweb provides Microsoft-focused IT services including SharePoint, "
+    "DIGICoCo provides Microsoft-focused IT services including SharePoint, "
     "Power Apps, Power Automate, Power BI, Office 365, Teams, Dynamics 365, Azure, "
     ".NET, migration, automation, and AI/chatbot solutions."
 )
 
 AI_SUMMARY = (
-    "Desire Infoweb AI services include Azure OpenAI-based solutions, Teams chatbots, "
+    "DIGICoCo AI services include Azure OpenAI-based solutions, Teams chatbots, "
     "Copilot-aligned workflows, intelligent automation, and document-grounded chatbot implementations."
 )
 
 AI_PROJECTS_SUMMARY = (
-    "Some AI project examples from Desire Infoweb include: "
+    "Some AI project examples from DIGICoCo include: "
     "(1) a Microsoft Teams chatbot integrated with ChatGPT, and "
     "(2) a document-grounded chatbot using SharePoint/Azure Blob as data sources "
     "to provide responses based on uploaded files."
@@ -70,7 +79,7 @@ BUDGET_SUMMARY = (
 )
 
 DOTNET_SUMMARY = (
-    "Desire Infoweb .NET services include custom enterprise application development, "
+    "DIGICoCo .NET services include custom enterprise application development, "
     "secure and scalable backend systems, workflow and approval systems, and modernization of existing applications."
 )
 
@@ -88,16 +97,13 @@ CHATBOT_DATA_SOURCE_SUMMARY = (
 )
 
 INDUSTRY_SUMMARY = (
-    "Desire Infoweb serves industries such as education, retail/e-commerce, finance, "
+    "DIGICoCo serves industries such as education, retail/e-commerce, finance, "
     "real estate, travel, healthcare, and logistics/distribution."
 )
 
 _conversation_lock = Lock()
 _conversation_store: dict[str, deque[tuple[str, str]]] = {}
-_lead_lock = Lock()
-_lead_store: dict[str, dict[str, str]] = {}
-_graph_token_lock = Lock()
-_graph_token: dict[str, float | str] = {"access_token": "", "expires_at": 0.0}
+
 
 
 def _get_required_env(name: str) -> str:
@@ -107,9 +113,16 @@ def _get_required_env(name: str) -> str:
     return value
 
 
-def _sanitize_header_value(value: str) -> str:
+def _sanitize_header_value(value: str, *, max_chars: int = 700) -> str:
     normalized = value.replace("\r", " ").replace("\n", " ").strip()
+    normalized = normalized[:max_chars]
     return normalized.encode("latin1", "ignore").decode("latin1")
+
+
+def _encode_header_value(value: str, *, max_chars: int = 2500) -> str:
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n").strip()
+    normalized = normalized[:max_chars]
+    return quote(normalized, safe="")
 
 
 def _normalize_user_query(query: str) -> str:
@@ -132,38 +145,8 @@ def _normalize_session_id(session_id: str | None) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]", "", value)[:64] or "default"
 
 
-def _normalize_lead_email(email: str | None) -> str:
-    value = (email or "").strip().lower()
-    if not value:
-        return ""
-    if not re.fullmatch(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", value):
-        raise HTTPException(status_code=400, detail="Invalid email format")
-    return value
-
-
-def _normalize_lead_name(name: str | None) -> str:
-    value = (name or "").strip()
-    return re.sub(r"\s+", " ", value)[:120]
-
-
-def _resolve_lead_identity(session_id: str, email: str | None, name: str | None) -> tuple[str, str]:
-    normalized_email = _normalize_lead_email(email)
-    normalized_name = _normalize_lead_name(name)
-
-    with _lead_lock:
-        if session_id not in _lead_store:
-            _lead_store[session_id] = {
-                "email": "",
-                "name": "",
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
-
-        if normalized_email:
-            _lead_store[session_id]["email"] = normalized_email
-        if normalized_name:
-            _lead_store[session_id]["name"] = normalized_name
-
-        return _lead_store[session_id]["email"], _lead_store[session_id]["name"]
+def _resolve_lead_identity(session_id: str) -> None:
+    pass
 
 
 def _build_conversation_transcript(session_id: str) -> str:
@@ -178,160 +161,15 @@ def _build_conversation_transcript(session_id: str) -> str:
     return "\n".join(lines)
 
 
-def _is_sharepoint_sync_enabled() -> bool:
-    return os.getenv("ENABLE_SHAREPOINT_SYNC", "false").lower() == "true"
+def _get_last_conversation_turn(session_id: str) -> tuple[str, str] | None:
+    with _conversation_lock:
+        history = _conversation_store.get(session_id)
+        if not history:
+            return None
+        return history[-1]
 
 
-def _is_sharepoint_always_insert_enabled() -> bool:
-    return os.getenv("SHAREPOINT_ALWAYS_INSERT", "true").lower() == "true"
-
-
-def _get_sharepoint_field_names() -> dict[str, str]:
-    return {
-        "title": os.getenv("SHAREPOINT_FIELD_TITLE", "Title").strip() or "Title",
-        "name": os.getenv("SHAREPOINT_FIELD_NAME", "Name").strip() or "Name",
-        "email": os.getenv("SHAREPOINT_FIELD_EMAIL", "email").strip() or "email",
-        "conversation": os.getenv("SHAREPOINT_FIELD_CONVERSATION", "Conversation").strip() or "Conversation",
-    }
-
-
-def _get_graph_token() -> str:
-    if not _is_sharepoint_sync_enabled():
-        return ""
-
-    with _graph_token_lock:
-        token_value = str(_graph_token.get("access_token", ""))
-        expires_at = float(_graph_token.get("expires_at", 0.0) or 0.0)
-        if token_value and expires_at - 60 > time():
-            return token_value
-
-    tenant_id = _get_required_env("SHAREPOINT_TENANT_ID")
-    client_id = _get_required_env("SHAREPOINT_CLIENT_ID")
-    client_secret = _get_required_env("SHAREPOINT_CLIENT_SECRET")
-    token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
-
-    response = httpx.post(
-        token_url,
-        data={
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "grant_type": "client_credentials",
-            "scope": "https://graph.microsoft.com/.default",
-        },
-        timeout=15.0,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    access_token = payload.get("access_token")
-    if not access_token:
-        raise ValueError("Failed to obtain Microsoft Graph access token.")
-
-    expires_in = float(payload.get("expires_in", 3600))
-    with _graph_token_lock:
-        _graph_token["access_token"] = access_token
-        _graph_token["expires_at"] = time() + expires_in
-
-    return access_token
-
-
-def _graph_request(method: str, url: str, **kwargs) -> dict:
-    token = _get_graph_token()
-    if not token:
-        raise ValueError("SharePoint sync is disabled or missing credentials.")
-
-    headers = dict(kwargs.pop("headers", {}))
-    headers["Authorization"] = f"Bearer {token}"
-    headers["Accept"] = "application/json"
-
-    response = httpx.request(method, url, headers=headers, timeout=20.0, **kwargs)
-    try:
-        response.raise_for_status()
-    except httpx.HTTPStatusError as error:
-        detail = ""
-        try:
-            payload = response.json()
-            detail = str(payload.get("error", payload))
-        except Exception:
-            detail = response.text[:500]
-        raise ValueError(
-            f"Microsoft Graph request failed ({response.status_code}) for {url}. Detail: {detail}"
-        ) from error
-    if response.status_code == 204:
-        return {}
-    return response.json()
-
-
-def _build_sharepoint_fields(lead_name: str, lead_email: str, transcript: str) -> dict[str, str]:
-    field_names = _get_sharepoint_field_names()
-    title_value = lead_name or lead_email
-    return {
-        field_names["title"]: title_value,
-        field_names["name"]: lead_name,
-        field_names["email"]: lead_email,
-        field_names["conversation"]: transcript,
-    }
-
-
-def _find_sharepoint_item_id(site_id: str, list_id: str, email_field: str, email_value: str) -> str | None:
-    escaped_email = email_value.replace("'", "''")
-    url = (
-        "https://graph.microsoft.com/v1.0"
-        f"/sites/{site_id}/lists/{list_id}/items"
-        f"?$expand=fields&$filter=fields/{email_field} eq '{escaped_email}'"
-    )
-    payload = _graph_request("GET", url)
-    items = payload.get("value", [])
-    if not items:
-        return None
-    return str(items[0].get("id") or "") or None
-
-
-def _upsert_sharepoint_lead(session_id: str) -> None:
-    if not _is_sharepoint_sync_enabled():
-        return
-
-    with _lead_lock:
-        lead = dict(_lead_store.get(session_id, {}))
-
-    if not lead:
-        return
-
-    lead_email = lead.get("email", "").strip()
-    lead_name = lead.get("name", "").strip()
-    if not lead_email or not lead_name:
-        return
-
-    transcript = _build_conversation_transcript(session_id)
-    if not transcript:
-        return
-
-    site_id = _get_required_env("SHAREPOINT_SITE_ID")
-    list_id = _get_required_env("SHAREPOINT_LIST_ID")
-    fields_payload = _build_sharepoint_fields(lead_name, lead_email, transcript)
-
-    if _is_sharepoint_always_insert_enabled():
-        create_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items"
-        _graph_request("POST", create_url, json={"fields": fields_payload})
-        return
-
-    field_names = _get_sharepoint_field_names()
-    item_id = _find_sharepoint_item_id(site_id, list_id, field_names["email"], lead_email)
-
-    if item_id:
-        update_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items/{item_id}/fields"
-        _graph_request("PATCH", update_url, json=fields_payload)
-        return
-
-    create_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items"
-    _graph_request("POST", create_url, json={"fields": fields_payload})
-
-
-async def _sync_sharepoint_lead_safely(session_id: str) -> None:
-    try:
-        _upsert_sharepoint_lead(session_id)
-    except Exception as error:
-        logger.warning("SharePoint sync skipped/failed for session %s: %s", session_id, error)
-
+# SharePoint logic removed
 
 def _direct_company_answer(query: str) -> str | None:
     q = query.lower().strip()
@@ -339,7 +177,7 @@ def _direct_company_answer(query: str) -> str | None:
 
     if re.fullmatch(r"(hi|hello|hey|hii|hiii|good morning|good afternoon|good evening)", compact):
         return (
-            "Hello! Welcome to Desire Infoweb. "
+            "Hello! Welcome to DIGICoCo. "
             f"{SERVICE_SUMMARY} "
             "Tell me your requirement and I can suggest the best service approach."
         )
@@ -408,19 +246,23 @@ def _direct_company_answer(query: str) -> str | None:
 
 
 def _get_embedding_model() -> str:
-    configured_model = os.getenv("GOOGLE_EMBEDDING_MODEL")
-    if configured_model:
-        return configured_model
-
-    return _detect_embedding_model()
+    return _get_required_env("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
 
 
 def _get_chat_model() -> str:
-    configured_model = os.getenv("GOOGLE_CHAT_MODEL")
-    if configured_model:
-        return configured_model
+    return _get_required_env("AZURE_OPENAI_CHAT_DEPLOYMENT")
 
-    return _detect_chat_model()
+
+def _get_azure_openai_endpoint() -> str:
+    return _get_required_env("AZURE_OPENAI_ENDPOINT")
+
+
+def _get_azure_openai_api_key() -> str:
+    return _get_required_env("AZURE_OPENAI_API_KEY")
+
+
+def _get_azure_openai_api_version() -> str:
+    return os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
 
 
 def _get_transcription_model() -> str:
@@ -432,7 +274,41 @@ def _get_tts_voice() -> str:
 
 
 def _get_max_output_tokens() -> int:
-    return int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "4024"))
+    requested_raw = os.getenv("LLM_MAX_OUTPUT_TOKENS", "1200")
+    model_cap_raw = os.getenv("AZURE_OPENAI_MAX_COMPLETION_TOKENS", "16384")
+
+    try:
+        requested_tokens = int(requested_raw)
+    except ValueError:
+        requested_tokens = 1200
+
+    try:
+        model_cap = int(model_cap_raw)
+    except ValueError:
+        model_cap = 16384
+
+    bounded_tokens = max(64, min(requested_tokens, model_cap))
+    if bounded_tokens != requested_tokens:
+        logger.warning(
+            "LLM_MAX_OUTPUT_TOKENS=%s exceeds allowed range; using %s instead.",
+            requested_tokens,
+            bounded_tokens,
+        )
+
+    return bounded_tokens
+
+
+def _get_llm_temperature() -> float:
+    return float(os.getenv("AZURE_OPENAI_TEMPERATURE", "0.1"))
+
+
+def _get_embedding_similarity_threshold() -> float:
+    raw_value = os.getenv("EMBEDDING_SIMILARITY_THRESHOLD", "0.45")
+    try:
+        threshold = float(raw_value)
+    except ValueError:
+        threshold = 0.45
+    return max(0.0, min(threshold, 1.0))
 
 
 def _get_memory_turns() -> int:
@@ -459,65 +335,16 @@ def _build_model_input(session_id: str, current_query: str) -> str:
     )
 
 
+def _sse_event(event: str, data: dict) -> str:
+    payload = json.dumps(data, ensure_ascii=False)
+    return f"event: {event}\ndata: {payload}\n\n"
+
+
 def _save_conversation_turn(session_id: str, user_text: str, assistant_text: str) -> None:
     with _conversation_lock:
         if session_id not in _conversation_store:
             _conversation_store[session_id] = deque(maxlen=_get_memory_turns())
         _conversation_store[session_id].append((user_text, assistant_text))
-
-
-@lru_cache(maxsize=1)
-def _detect_embedding_model() -> str:
-    genai.configure(api_key=_get_required_env("GOOGLE_API_KEY"))
-
-    available_models: list[str] = []
-    for model in genai.list_models():
-        methods = set(getattr(model, "supported_generation_methods", []) or [])
-        if "embedContent" in methods:
-            model_name = getattr(model, "name", "")
-            if model_name:
-                available_models.append(model_name)
-
-    if not available_models:
-        raise ValueError(
-            "No Google embedding models are available for this API key. "
-            "Set GOOGLE_EMBEDDING_MODEL explicitly to a supported model."
-        )
-
-    preferred_suffixes = ["text-embedding-004", "embedding-001", "text-embedding-005"]
-    for suffix in preferred_suffixes:
-        for model_name in available_models:
-            if model_name.endswith(suffix):
-                return model_name
-
-    return available_models[0]
-
-
-@lru_cache(maxsize=1)
-def _detect_chat_model() -> str:
-    genai.configure(api_key=_get_required_env("GOOGLE_API_KEY"))
-
-    available_models: list[str] = []
-    for model in genai.list_models():
-        methods = set(getattr(model, "supported_generation_methods", []) or [])
-        if "generateContent" in methods:
-            model_name = getattr(model, "name", "")
-            if model_name:
-                available_models.append(model_name)
-
-    if not available_models:
-        raise ValueError(
-            "No Google chat models are available for this API key. "
-            "Set GOOGLE_CHAT_MODEL explicitly to a supported model."
-        )
-
-    preferred_suffixes = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro", "gemini-pro"]
-    for suffix in preferred_suffixes:
-        for model_name in available_models:
-            if model_name.endswith(suffix):
-                return model_name
-
-    return available_models[0]
 
 
 def ensure_pinecone_index_exists() -> None:
@@ -537,7 +364,7 @@ def ensure_pinecone_index_exists() -> None:
                 "Create it manually or set AUTO_CREATE_PINECONE_INDEX=true."
             ) from error
 
-    dimension = int(os.getenv("PINECONE_DIMENSION", "768"))
+    dimension = int(os.getenv("PINECONE_DIMENSION", "1536"))
     metric = os.getenv("PINECONE_METRIC", "cosine")
     cloud = os.getenv("PINECONE_CLOUD", "aws")
     region = os.getenv("PINECONE_REGION", "us-east-1")
@@ -565,9 +392,12 @@ def ensure_pinecone_index_exists() -> None:
 
 
 system_prompt = (
-    "You are Desire Infoweb's professional virtual assistant for an IT services company. "
+    "You are DIGICoCo's professional virtual assistant for an IT services company. "
     "Answer the user's exact question directly and clearly using only company context. "
     "Do not start with generic filler like 'Would you like to know more?'. "
+    "Always return the final answer in valid GitHub-flavored Markdown (GFM). "
+    "Use clean Markdown structure with short paragraphs and bullet points when useful. "
+    "Do not output raw HTML. Do not output JSON unless the user explicitly asks for JSON. "
     "If the user asks about services, provide concrete service categories first. "
     "If the user asks about AI, explain Desire Infoweb AI offerings specifically. "
     "If the user asks about budget/cost, explain that pricing depends on scope and ask for key requirements. "
@@ -585,28 +415,228 @@ prompt = ChatPromptTemplate.from_messages([
 
 
 @lru_cache(maxsize=1)
+def get_azure_openai_client() -> AzureOpenAI:
+    return AzureOpenAI(
+        api_version=_get_azure_openai_api_version(),
+        azure_endpoint=_get_azure_openai_endpoint(),
+        api_key=_get_azure_openai_api_key(),
+    )
+
+
+@lru_cache(maxsize=1)
+def get_async_azure_openai_client() -> AsyncAzureOpenAI:
+    return AsyncAzureOpenAI(
+        api_version=_get_azure_openai_api_version(),
+        azure_endpoint=_get_azure_openai_endpoint(),
+        api_key=_get_azure_openai_api_key(),
+    )
+
+
+
+@lru_cache(maxsize=1)
 def get_groq_client() -> Groq:
     return Groq(api_key=_get_required_env("GROQ_API_KEY"))
 
 
 @lru_cache(maxsize=1)
-def get_rag_chain():
+def get_vectorstore() -> PineconeVectorStore:
     ensure_pinecone_index_exists()
-
-    llm = ChatGoogleGenerativeAI(
-        model=_get_chat_model(),
-        temperature=0.1,
-        max_output_tokens=_get_max_output_tokens(),
-        convert_system_message_to_human=True,
+    embedding_deployment = _get_embedding_model()
+    embeddings = AzureOpenAIEmbeddings(
+        azure_endpoint=_get_azure_openai_endpoint(),
+        api_key=_get_azure_openai_api_key(),
+        openai_api_version=_get_azure_openai_api_version(),
+        azure_deployment=embedding_deployment,
+        model=embedding_deployment,
     )
-    embeddings = GoogleGenerativeAIEmbeddings(model=_get_embedding_model())
     vectorstore = PineconeVectorStore(
         index_name=_get_required_env("PINECONE_INDEX_NAME"),
         embedding=embeddings,
     )
+    return vectorstore
+
+
+@lru_cache(maxsize=1)
+def get_rag_chain():
+    llm = AzureChatOpenAI(
+        azure_endpoint=_get_azure_openai_endpoint(),
+        api_key=_get_azure_openai_api_key(),
+        openai_api_version=_get_azure_openai_api_version(),
+        azure_deployment=_get_chat_model(),
+        temperature=_get_llm_temperature(),
+        max_tokens=_get_max_output_tokens(),
+    )
+    vectorstore = get_vectorstore()
     retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
     question_answer_chain = create_stuff_documents_chain(llm, prompt)
     return create_retrieval_chain(retriever, question_answer_chain)
+
+
+@lru_cache(maxsize=1)
+def get_retriever():
+    return get_vectorstore().as_retriever(search_kwargs={"k": 5})
+
+
+def _retrieve_context_and_score(query: str) -> tuple[str, float]:
+    try:
+        matches = get_vectorstore().similarity_search_with_relevance_scores(query, k=5)
+    except Exception as retriever_error:
+        logger.warning("Retriever lookup failed for score-based retrieval (%s).", retriever_error)
+        return "", 0.0
+
+    context_chunks: list[str] = []
+    top_score = 0.0
+
+
+    for document, score in matches:
+        try:
+            score_value = float(score)
+        except (TypeError, ValueError):
+            score_value = 0.0
+
+        if score_value > top_score:
+            top_score = score_value
+
+        page_content = str(getattr(document, "page_content", "") or "").strip()
+        if not page_content:
+            continue
+
+        context_chunks.append(page_content[:2000])
+        if len(context_chunks) >= 5:
+            break
+
+    return "\n\n".join(context_chunks), top_score
+
+
+def _should_use_embedding_context(retrieved_context: str, top_score: float) -> bool:
+    if not retrieved_context:
+        return False
+    return top_score >= _get_embedding_similarity_threshold()
+
+
+def _build_retrieved_context(query: str) -> str:
+    context, _ = _retrieve_context_and_score(query)
+    return context
+
+
+async def _generate_completion_with_context(model_input: str, retrieved_context: str) -> str:
+    client = get_async_azure_openai_client()
+    completion = await client.chat.completions.create(
+        model=_get_chat_model(),
+        messages=[
+            {"role": "system", "content": system_prompt.replace("{context}", retrieved_context)},
+            {"role": "user", "content": model_input},
+        ],
+        temperature=_get_llm_temperature(),
+        max_tokens=_get_max_output_tokens(),
+        stream=False,
+    )
+
+
+    if not completion.choices:
+        raise ValueError("Completion response returned no choices.")
+
+    message = completion.choices[0].message
+    answer = str(getattr(message, "content", "") or "").strip()
+    if not answer:
+        raise ValueError("Completion response returned an empty answer.")
+
+    return answer
+
+
+async def _stream_answer_tokens(model_input: str, normalized_query: str) -> AsyncGenerator[str, None]:
+    retrieved_context, top_score = _retrieve_context_and_score(normalized_query)
+    use_embedding_context = _should_use_embedding_context(retrieved_context, top_score)
+
+    if not use_embedding_context:
+        direct_answer = _direct_company_answer(normalized_query)
+        if direct_answer:
+            yield direct_answer
+            return
+
+    try:
+        client = get_async_azure_openai_client()
+        completion_stream = await client.chat.completions.create(
+            model=_get_chat_model(),
+            messages=[
+                {"role": "system", "content": system_prompt.replace("{context}", retrieved_context)},
+                {"role": "user", "content": model_input},
+            ],
+            temperature=_get_llm_temperature(),
+            max_tokens=_get_max_output_tokens(),
+            stream=True,
+        )
+
+        has_streamed_content = False
+        async for chunk in completion_stream:
+            if not chunk.choices:
+                continue
+
+
+            delta = chunk.choices[0].delta
+            token = getattr(delta, "content", None) if delta else None
+            if not token:
+                continue
+
+            has_streamed_content = True
+            yield token
+
+        if not has_streamed_content:
+            raise ValueError("Streaming response returned no content.")
+    except Exception as stream_error:
+        logger.warning(
+            "Streaming generation failed (%s). Falling back to non-streaming answer.",
+            stream_error,
+        )
+        fallback_answer = await _generate_answer(
+            model_input,
+            normalized_query,
+            retrieved_context=retrieved_context,
+            top_score=top_score,
+        )
+        if fallback_answer:
+            yield fallback_answer
+
+
+
+async def _generate_answer(
+    model_input: str,
+    normalized_query: str,
+    retrieved_context: str | None = None,
+    top_score: float | None = None,
+) -> str:
+
+    if retrieved_context is None or top_score is None:
+        retrieved_context, top_score = _retrieve_context_and_score(normalized_query)
+
+    use_embedding_context = _should_use_embedding_context(retrieved_context, top_score)
+    direct_answer = None if use_embedding_context else _direct_company_answer(normalized_query)
+
+    if use_embedding_context:
+        try:
+            return await _generate_completion_with_context(model_input, retrieved_context)
+        except Exception as completion_error:
+
+            logger.warning(
+                "Context-grounded completion failed (%s). Falling back to RAG chain.",
+                completion_error,
+            )
+
+    try:
+        rag_chain = get_rag_chain()
+        response = rag_chain.invoke({"input": model_input})
+        answer = str(response.get("answer", "")).strip()
+        if answer:
+            return answer
+        raise ValueError("Azure OpenAI RAG chain returned an empty answer.")
+    except Exception as rag_error:
+        if direct_answer:
+            logger.warning(
+                "RAG generation failed (%s). Returning direct fallback answer.",
+                rag_error,
+            )
+            return direct_answer
+        raise
 
 
 @app.get("/health")
@@ -618,43 +648,92 @@ async def health() -> dict:
 async def text_chat(
     query: str = Form(...),
     session_id: str | None = Form(default=None),
-    lead_email: str | None = Form(default=None),
-    lead_name: str | None = Form(default=None),
 ) -> dict:
     try:
         normalized_query = _normalize_user_query(query)
-
         effective_session_id = _normalize_session_id(session_id)
-        current_lead_email, current_lead_name = _resolve_lead_identity(
-            effective_session_id,
-            lead_email,
-            lead_name,
-        )
 
         model_input = _build_model_input(effective_session_id, normalized_query)
-
-        rag_chain = get_rag_chain()
-        response = rag_chain.invoke({"input": model_input})
-        answer = response["answer"]
+        answer = await _generate_answer(model_input, normalized_query)
         _save_conversation_turn(effective_session_id, normalized_query, answer)
-        await _sync_sharepoint_lead_safely(effective_session_id)
+
 
         return {
             "reply": answer,
             "session_id": effective_session_id,
-            "lead": {
-                "email": current_lead_email,
-                "name": current_lead_name,
-            },
         }
     except Exception as error:
+        logger.exception("Text chat pipeline failed")
         raise HTTPException(
             status_code=500,
             detail=(
-                "RAG backend is not ready. Verify GOOGLE_API_KEY, PINECONE_API_KEY, "
-                "PINECONE_INDEX_NAME, and ensure the Pinecone index exists."
+                "Answer generation failed. Verify AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, "
+                "AZURE_OPENAI_CHAT_DEPLOYMENT, AZURE_OPENAI_EMBEDDING_DEPLOYMENT, and Pinecone settings."
             ),
         ) from error
+
+
+@app.post("/api/chat/text/stream")
+async def text_chat_stream(
+    query: str = Form(...),
+    session_id: str | None = Form(default=None),
+) -> StreamingResponse:
+    normalized_query = _normalize_user_query(query)
+    effective_session_id = _normalize_session_id(session_id)
+    model_input = _build_model_input(effective_session_id, normalized_query)
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        answer_parts: list[str] = []
+
+        try:
+            async for token in _stream_answer_tokens(model_input, normalized_query):
+                if not token:
+
+                    continue
+                answer_parts.append(token)
+                yield _sse_event("token", {"token": token})
+
+            final_answer = "".join(answer_parts).strip()
+            if not final_answer:
+                final_answer = await _generate_answer(model_input, normalized_query)
+                if final_answer:
+                    yield _sse_event("token", {"token": final_answer})
+
+
+            _save_conversation_turn(effective_session_id, normalized_query, final_answer)
+
+            yield _sse_event(
+                "done",
+                {
+                    "reply": final_answer,
+                    "session_id": effective_session_id,
+                },
+            )
+        except Exception as error:
+            logger.exception("Text chat streaming pipeline failed")
+            yield _sse_event(
+                "error",
+                {
+                    "message": (
+                        "Answer generation failed. Verify AZURE_OPENAI_ENDPOINT, "
+                        "AZURE_OPENAI_API_KEY, AZURE_OPENAI_CHAT_DEPLOYMENT, "
+                        "AZURE_OPENAI_EMBEDDING_DEPLOYMENT, and Pinecone settings. "
+                        f"Error: {type(error).__name__}: {str(error)}"
+                    ),
+                    "error_type": type(error).__name__,
+
+                },
+            )
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/api/ingest/upload")
@@ -697,8 +776,6 @@ async def ingest_upload(
 async def voice_chat(
     audio: UploadFile = File(...),
     x_session_id: str | None = Header(default=None),
-    x_lead_email: str | None = Header(default=None),
-    x_lead_name: str | None = Header(default=None),
 ) -> Response:
     input_filename = audio.filename or "recording.webm"
 
@@ -739,19 +816,10 @@ async def voice_chat(
             raise HTTPException(status_code=400, detail="Could not transcribe user audio.")
 
         effective_session_id = _normalize_session_id(x_session_id)
-        _resolve_lead_identity(
-            effective_session_id,
-            x_lead_email,
-            x_lead_name,
-        )
-
         model_input = _build_model_input(effective_session_id, user_text)
-
-        rag_chain = get_rag_chain()
-        response = rag_chain.invoke({"input": model_input})
-        bot_reply_text = response["answer"]
+        bot_reply_text = await _generate_answer(model_input, user_text)
         _save_conversation_turn(effective_session_id, user_text, bot_reply_text)
-        await _sync_sharepoint_lead_safely(effective_session_id)
+
 
         communicate = edge_tts.Communicate(bot_reply_text, _get_tts_voice())
         output_audio_bytes = bytearray()
@@ -764,8 +832,11 @@ async def voice_chat(
             media_type="audio/mpeg",
             headers={
                 "Content-Disposition": "inline; filename=reply.mp3",
+                "X-Session-Id": effective_session_id,
                 "X-User-Query": _sanitize_header_value(user_text),
                 "X-Bot-Reply": _sanitize_header_value(bot_reply_text),
+                "X-User-Query-Encoded": _encode_header_value(user_text),
+                "X-Bot-Reply-Encoded": _encode_header_value(bot_reply_text),
             },
         )
     except HTTPException:
@@ -781,3 +852,21 @@ async def voice_chat(
         ) from error
     finally:
         await audio.close()
+
+
+@app.get("/api/chat/last")
+async def get_last_chat_turn(session_id: str) -> dict:
+    effective_session_id = _normalize_session_id(session_id)
+    last_turn = _get_last_conversation_turn(effective_session_id)
+    if not last_turn:
+        raise HTTPException(status_code=404, detail="No conversation found for session_id")
+
+    user_text, bot_reply_text = last_turn
+
+    return {
+        "session_id": effective_session_id,
+        "user_query": user_text,
+        "reply": bot_reply_text,
+    }
+
+

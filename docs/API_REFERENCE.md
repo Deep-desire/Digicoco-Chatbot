@@ -80,8 +80,72 @@ curl -X POST "http://localhost:8000/api/chat/voice" \
 
 - Body: MP3 audio stream (`audio/mpeg`)
 - Headers:
+  - `X-Session-Id`: normalized session identifier used by backend
   - `X-User-Query`: transcribed user text
   - `X-Bot-Reply`: generated assistant response text
+  - `X-User-Query-Encoded`: URL-encoded transcription (preserves newlines/Unicode)
+  - `X-Bot-Reply-Encoded`: URL-encoded assistant response (preserves newlines/Unicode)
+
+Notes:
+
+- Use the `*-Encoded` headers when displaying text in clients.
+- Legacy plain headers are retained for backward compatibility and may be sanitized/truncated for transport safety.
+
+## GET /api/chat/last
+
+Returns the most recent conversation turn for a session as JSON.
+
+### Request
+
+- Query param: `session_id` (string, required)
+
+### Example (curl)
+
+```bash
+curl "http://localhost:8000/api/chat/last?session_id=abc123"
+```
+
+### Response
+
+```json
+{
+  "session_id": "abc123",
+  "user_query": "What services do you offer?",
+  "reply": "We provide ...",
+  "lead": {
+    "email": "user@example.com",
+    "name": "John Doe"
+  }
+}
+```
+
+## GET /api/chat/suggestions
+
+Returns context-aware suggested follow-up questions generated from recent conversation turns.
+
+### Request
+
+- Query param: `session_id` (string, required)
+- Query param: `limit` (number, optional, default `3`, min `1`, max `6`)
+
+### Example (curl)
+
+```bash
+curl "http://localhost:8000/api/chat/suggestions?session_id=abc123&limit=3"
+```
+
+### Response
+
+```json
+{
+  "session_id": "abc123",
+  "suggestions": [
+    "How would you design an AI solution for my specific business use case?",
+    "What details do you need from me to prepare an accurate estimate?",
+    "What post-launch support and maintenance model do you provide?"
+  ]
+}
+```
 
 ## POST /api/ingest/upload
 

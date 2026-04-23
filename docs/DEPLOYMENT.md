@@ -30,9 +30,14 @@ Ensure repository contains:
 
 Add these on the platform:
 
-- `GOOGLE_API_KEY`
-- `PINECONE_API_KEY`
+- `AZURE_OPENAI_ENDPOINT`
+- `AZURE_OPENAI_API_KEY`
+- `AZURE_OPENAI_API_VERSION`
+- `AZURE_OPENAI_CHAT_DEPLOYMENT`
+- `AZURE_OPENAI_EMBEDDING_DEPLOYMENT`
 - `GROQ_API_KEY`
+- `GROQ_TRANSCRIPTION_MODEL`
+- `PINECONE_API_KEY`
 - `PINECONE_INDEX_NAME`
 - `INGEST_API_KEY` (optional but recommended to protect ingestion endpoint)
 
@@ -83,12 +88,12 @@ Also:
 
 - Check missing/invalid API keys
 - Verify Pinecone index exists and name matches `PINECONE_INDEX_NAME`
-- Confirm index dimension is `768`
+- Confirm index dimension matches your embedding deployment (for example `1536` for `text-embedding-3-small`)
 
 ### 5.2 Voice endpoint errors
 
 - Ensure incoming mime type is browser-generated `audio/webm`
-- Verify `GROQ_API_KEY`
+- Verify `GROQ_API_KEY` and `GROQ_TRANSCRIPTION_MODEL`
 - Confirm network egress to Groq is allowed
 
 ### 5.3 Empty or poor answers
