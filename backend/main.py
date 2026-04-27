@@ -9,6 +9,7 @@ from collections import deque
 from functools import lru_cache
 from pathlib import Path
 from threading import Lock
+from threading import Thread
 from time import sleep
 from time import time
 from typing import Any, AsyncGenerator, Iterable
@@ -110,6 +111,8 @@ _digicoco_kb_ingest_attempted = False
 
 KNOWLEDGE_BASE_FILE = Path("Knowledge base") / "DIGICoCo_Knowledge_Base.txt"
 KNOWLEDGE_BASE_SOURCE_NAME = KNOWLEDGE_BASE_FILE.name
+KB_CHUNK_SIZE_CHARS = 1800
+KB_CHUNK_OVERLAP_CHARS = 300
 
 
 
@@ -210,6 +213,71 @@ def _is_digicoco_source(source_value: str | None) -> bool:
     if not source_value:
         return False
     return Path(str(source_value)).name.lower() == KNOWLEDGE_BASE_SOURCE_NAME.lower()
+
+
+@lru_cache(maxsize=1)
+def _load_digicoco_kb_text() -> str:
+    kb_path = Path(__file__).parent / KNOWLEDGE_BASE_FILE
+    try:
+        return kb_path.read_text(encoding="utf-8")
+    except Exception as read_error:
+        logger.warning("Unable to read DIGICoCo knowledge-base text file: %s", read_error)
+        return ""
+
+
+def _build_kb_chunks() -> list[str]:
+    kb_text = _load_digicoco_kb_text().strip()
+    if not kb_text:
+        return []
+
+    chunks: list[str] = []
+    start = 0
+    text_len = len(kb_text)
+    while start < text_len:
+        end = min(start + KB_CHUNK_SIZE_CHARS, text_len)
+        chunk = kb_text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        if end >= text_len:
+            break
+        start = max(0, end - KB_CHUNK_OVERLAP_CHARS)
+    return chunks
+
+
+@lru_cache(maxsize=1)
+def _get_kb_chunks() -> list[str]:
+    return _build_kb_chunks()
+
+
+def _simple_tokens(text: str) -> set[str]:
+    return {token for token in re.findall(r"[a-z0-9]+", text.lower()) if len(token) > 2}
+
+
+def _retrieve_local_kb_context(query: str, *, limit: int = 5) -> tuple[str, float]:
+    query_tokens = _simple_tokens(query)
+    if not query_tokens:
+        return "", 0.0
+
+    scored_chunks: list[tuple[float, str]] = []
+    for chunk in _get_kb_chunks():
+        chunk_tokens = _simple_tokens(chunk)
+        if not chunk_tokens:
+            continue
+        overlap = query_tokens.intersection(chunk_tokens)
+        if not overlap:
+            continue
+
+        # Reward direct token overlap while keeping score in [0, 1].
+        score = len(overlap) / max(len(query_tokens), 1)
+        scored_chunks.append((score, chunk))
+
+    if not scored_chunks:
+        return "", 0.0
+
+    scored_chunks.sort(key=lambda item: item[0], reverse=True)
+    selected = [chunk for _, chunk in scored_chunks[: max(1, min(limit, 8))]]
+    top_score = float(scored_chunks[0][0])
+    return "\n\n".join(selected), top_score
 
 
 def _ensure_digicoco_knowledge_base_ingested() -> None:
@@ -462,7 +530,7 @@ def ensure_pinecone_index_exists() -> None:
 
 system_prompt = (
     "You are DIGICoCo's professional virtual assistant for an IT services company. "
-    "Answer the user's exact question directly and clearly using only company context. "
+    "Answer the user's exact question directly and clearly using ONLY the provided DIGICoCo knowledge-base context. "
     "Do not start with generic filler like 'Would you like to know more?'. "
     "Always return the final answer in valid GitHub-flavored Markdown (GFM). "
     "Use clean Markdown structure with short paragraphs and bullet points when useful. "
@@ -470,9 +538,10 @@ system_prompt = (
     "If the user asks about services, provide concrete service categories first. "
     "If the user asks about AI, explain DIGICoCo AI offerings specifically. "
     "If the user asks about budget/cost, explain that pricing depends on scope and ask for key requirements. "
-    "If the user asks about previous projects, provide relevant examples from available context. "
+    "If the user asks about previous projects, provide relevant examples only if they are present in context. "
     "For follow-up questions, continue in context and avoid repeating generic summaries. "
-    "If you do not know, say that clearly and offer to connect the user with the team. "
+    "If the answer is not present in context, clearly say the information is not available in DIGICoCo knowledge base. "
+    "Do not use external knowledge or assumptions. "
     "Keep answers business-focused, friendly, and practical. Prefer complete answers (around 3-8 sentences) when useful.\n\n"
     "Context: {context}"
 )
@@ -547,7 +616,9 @@ def get_retriever():
 
 
 def _retrieve_context_and_score(query: str) -> tuple[str, float]:
-    _ensure_digicoco_knowledge_base_ingested()
+    pinecone_context = ""
+    pinecone_score = 0.0
+
     try:
         matches = get_vectorstore().similarity_search_with_relevance_scores(
             query,
@@ -556,7 +627,7 @@ def _retrieve_context_and_score(query: str) -> tuple[str, float]:
         )
     except Exception as retriever_error:
         logger.warning("Retriever lookup failed for score-based retrieval (%s).", retriever_error)
-        return "", 0.0
+        matches = []
 
     context_chunks: list[str] = []
     top_score = 0.0
@@ -583,7 +654,13 @@ def _retrieve_context_and_score(query: str) -> tuple[str, float]:
         if len(context_chunks) >= 5:
             break
 
-    return "\n\n".join(context_chunks), top_score
+    pinecone_context = "\n\n".join(context_chunks)
+    pinecone_score = top_score
+    if pinecone_context:
+        return pinecone_context, pinecone_score
+
+    local_context, local_score = _retrieve_local_kb_context(query, limit=5)
+    return local_context, local_score
 
 
 def _should_use_embedding_context(retrieved_context: str, top_score: float) -> bool:
@@ -639,14 +716,6 @@ async def _stream_answer_tokens_with_context(
     retrieved_context: str,
     top_score: float,
 ) -> AsyncGenerator[str, None]:
-    use_embedding_context = _should_use_embedding_context(retrieved_context, top_score)
-
-    if not use_embedding_context:
-        direct_answer = _direct_company_answer(normalized_query)
-        if direct_answer:
-            yield direct_answer
-            return
-
     try:
         client = get_async_azure_openai_client()
         completion_stream = await client.chat.completions.create(
@@ -702,27 +771,11 @@ async def _generate_answer(
     if retrieved_context is None or top_score is None:
         retrieved_context, top_score = _retrieve_context_and_score(normalized_query)
 
-    use_embedding_context = _should_use_embedding_context(retrieved_context, top_score)
-    direct_answer = None if use_embedding_context else _direct_company_answer(normalized_query)
-
-    if use_embedding_context:
-        try:
-            return await _generate_completion_with_context(model_input, retrieved_context)
-        except Exception as completion_error:
-
-            logger.warning(
-                "Context-grounded completion failed (%s). Falling back to RAG chain.",
-                completion_error,
-            )
-
-    if direct_answer:
-        return direct_answer
-
-    # Keep responses bounded to DIGICoCo context when no confident retrieval exists.
-    return (
-        "I could not find enough DIGICoCo knowledge-base context for that question. "
-        "Please ask about DIGICoCo services, projects, technologies, or share a more specific query."
-    )
+    try:
+        return await _generate_completion_with_context(model_input, retrieved_context)
+    except Exception as completion_error:
+        logger.warning("Context-grounded completion failed (%s).", completion_error)
+        raise
 
 
 @app.get("/health")
@@ -732,7 +785,18 @@ async def health() -> dict:
 
 @app.on_event("startup")
 async def _startup_ingestion() -> None:
-    _ensure_digicoco_knowledge_base_ingested()
+    run_on_startup = os.getenv("AUTO_INGEST_DIGICOCO_KB_ON_STARTUP", "false").lower() == "true"
+    if not run_on_startup:
+        logger.info("Skipping DIGICoCo knowledge-base ingestion at startup for faster boot.")
+        return
+
+    def _ingest_in_background() -> None:
+        try:
+            _ensure_digicoco_knowledge_base_ingested()
+        except Exception as startup_ingest_error:
+            logger.warning("Background startup ingestion failed: %s", startup_ingest_error)
+
+    Thread(target=_ingest_in_background, daemon=True).start()
 
 
 @app.post("/api/chat/text")
@@ -743,20 +807,6 @@ async def text_chat(
     try:
         normalized_query = _normalize_user_query(query)
         effective_session_id = _normalize_session_id(session_id)
-        direct_answer = _direct_company_answer(normalized_query)
-        if direct_answer:
-            _save_conversation_turn(effective_session_id, normalized_query, direct_answer)
-            _append_pipeline_log(
-                session_id=effective_session_id,
-                user_query=normalized_query,
-                ai_search={"knowledge_source": KNOWLEDGE_BASE_SOURCE_NAME, "mode": "direct"},
-                ai_response=direct_answer,
-                outcome="success",
-            )
-            return {
-                "reply": direct_answer,
-                "session_id": effective_session_id,
-            }
 
         model_input = _build_model_input(effective_session_id, normalized_query)
         retrieved_context, top_score = _retrieve_context_and_score(normalized_query)
@@ -809,7 +859,6 @@ async def text_chat_stream(
 ) -> StreamingResponse:
     normalized_query = _normalize_user_query(query)
     effective_session_id = _normalize_session_id(session_id)
-    direct_answer = _direct_company_answer(normalized_query)
     model_input = _build_model_input(effective_session_id, normalized_query)
 
     async def event_generator() -> AsyncGenerator[str, None]:
@@ -818,25 +867,6 @@ async def text_chat_stream(
         top_score = 0.0
 
         try:
-            if direct_answer:
-                _save_conversation_turn(effective_session_id, normalized_query, direct_answer)
-                _append_pipeline_log(
-                    session_id=effective_session_id,
-                    user_query=normalized_query,
-                    ai_search={"knowledge_source": KNOWLEDGE_BASE_SOURCE_NAME, "mode": "direct"},
-                    ai_response=direct_answer,
-                    outcome="success",
-                )
-                yield _sse_event("token", {"token": direct_answer})
-                yield _sse_event(
-                    "done",
-                    {
-                        "reply": direct_answer,
-                        "session_id": effective_session_id,
-                    },
-                )
-                return
-
             retrieved_context, top_score = _retrieve_context_and_score(normalized_query)
             async for token in _stream_answer_tokens_with_context(
                 model_input=model_input,
@@ -991,38 +1021,26 @@ async def voice_chat(
             raise HTTPException(status_code=400, detail="Could not transcribe user audio.")
 
         effective_session_id = _normalize_session_id(x_session_id)
-        direct_answer = _direct_company_answer(user_text)
-        if direct_answer:
-            _save_conversation_turn(effective_session_id, user_text, direct_answer)
-            _append_pipeline_log(
-                session_id=effective_session_id,
-                user_query=user_text,
-                ai_search={"knowledge_source": KNOWLEDGE_BASE_SOURCE_NAME, "mode": "direct"},
-                ai_response=direct_answer,
-                outcome="success",
-            )
-            bot_reply_text = direct_answer
-        else:
-            model_input = _build_model_input(effective_session_id, user_text)
-            retrieved_context, top_score = _retrieve_context_and_score(user_text)
-            bot_reply_text = await _generate_answer(
-                model_input,
-                user_text,
-                retrieved_context=retrieved_context,
-                top_score=top_score,
-            )
-            _save_conversation_turn(effective_session_id, user_text, bot_reply_text)
-            _append_pipeline_log(
-                session_id=effective_session_id,
-                user_query=user_text,
-                ai_search={
-                    "knowledge_source": KNOWLEDGE_BASE_SOURCE_NAME,
-                    "top_score": top_score,
-                    "context_found": bool(retrieved_context),
-                },
-                ai_response=bot_reply_text,
-                outcome="success",
-            )
+        model_input = _build_model_input(effective_session_id, user_text)
+        retrieved_context, top_score = _retrieve_context_and_score(user_text)
+        bot_reply_text = await _generate_answer(
+            model_input,
+            user_text,
+            retrieved_context=retrieved_context,
+            top_score=top_score,
+        )
+        _save_conversation_turn(effective_session_id, user_text, bot_reply_text)
+        _append_pipeline_log(
+            session_id=effective_session_id,
+            user_query=user_text,
+            ai_search={
+                "knowledge_source": KNOWLEDGE_BASE_SOURCE_NAME,
+                "top_score": top_score,
+                "context_found": bool(retrieved_context),
+            },
+            ai_response=bot_reply_text,
+            outcome="success",
+        )
 
 
         communicate = edge_tts.Communicate(bot_reply_text, _get_tts_voice())
