@@ -11,7 +11,7 @@ from pathlib import Path
 from threading import Lock
 from time import sleep
 from time import time
-from typing import AsyncGenerator, Iterable
+from typing import Any, AsyncGenerator, Iterable
 from urllib.parse import quote
 
 import edge_tts
@@ -103,6 +103,13 @@ INDUSTRY_SUMMARY = (
 
 _conversation_lock = Lock()
 _conversation_store: dict[str, deque[tuple[str, str]]] = {}
+_pipeline_log_lock = Lock()
+_pipeline_logs: deque[dict[str, Any]] = deque(maxlen=500)
+_digicoco_kb_ready = False
+_digicoco_kb_ingest_attempted = False
+
+KNOWLEDGE_BASE_FILE = Path("Knowledge base") / "DIGICoCo_Knowledge_Base.txt"
+KNOWLEDGE_BASE_SOURCE_NAME = KNOWLEDGE_BASE_FILE.name
 
 
 
@@ -161,12 +168,74 @@ def _build_conversation_transcript(session_id: str) -> str:
     return "\n".join(lines)
 
 
+def _append_pipeline_log(
+    *,
+    session_id: str,
+    user_query: str,
+    ai_search: dict[str, Any] | None = None,
+    ai_response: str | None = None,
+    outcome: str,
+    error: str | None = None,
+) -> None:
+    with _pipeline_log_lock:
+        _pipeline_logs.append(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "session_id": session_id,
+                "user_query": user_query,
+                "ai_search": ai_search or {},
+                "ai_response": ai_response or "",
+                "outcome": outcome,
+                "error": error or "",
+            }
+        )
+
+
+def _get_recent_user_prompts(limit: int = 10) -> list[str]:
+    safe_limit = max(1, min(limit, 100))
+    with _pipeline_log_lock:
+        recent_logs = list(_pipeline_logs)[-safe_limit:]
+    return [entry["user_query"] for entry in recent_logs]
+
+
 def _get_last_conversation_turn(session_id: str) -> tuple[str, str] | None:
     with _conversation_lock:
         history = _conversation_store.get(session_id)
         if not history:
             return None
         return history[-1]
+
+
+def _is_digicoco_source(source_value: str | None) -> bool:
+    if not source_value:
+        return False
+    return Path(str(source_value)).name.lower() == KNOWLEDGE_BASE_SOURCE_NAME.lower()
+
+
+def _ensure_digicoco_knowledge_base_ingested() -> None:
+    global _digicoco_kb_ready, _digicoco_kb_ingest_attempted
+    if _digicoco_kb_ready:
+        return
+
+    # Do not retry expensive ingestion on every user request if it already failed once.
+    if _digicoco_kb_ingest_attempted:
+        return
+    _digicoco_kb_ingest_attempted = True
+
+    if os.getenv("AUTO_INGEST_DIGICOCO_KB", "true").lower() != "true":
+        return
+
+    kb_path = Path(__file__).parent / KNOWLEDGE_BASE_FILE
+    if not kb_path.exists():
+        logger.warning("DIGICoCo knowledge-base file not found at %s", kb_path)
+        return
+
+    try:
+        ingest_file(str(kb_path), source_name=KNOWLEDGE_BASE_SOURCE_NAME)
+        _digicoco_kb_ready = True
+        logger.info("DIGICoCo knowledge-base ingested for RAG: %s", kb_path)
+    except Exception as ingest_error:
+        logger.warning("DIGICoCo knowledge-base ingestion failed: %s", ingest_error)
 
 
 # SharePoint logic removed
@@ -399,7 +468,7 @@ system_prompt = (
     "Use clean Markdown structure with short paragraphs and bullet points when useful. "
     "Do not output raw HTML. Do not output JSON unless the user explicitly asks for JSON. "
     "If the user asks about services, provide concrete service categories first. "
-    "If the user asks about AI, explain Desire Infoweb AI offerings specifically. "
+    "If the user asks about AI, explain DIGICoCo AI offerings specifically. "
     "If the user asks about budget/cost, explain that pricing depends on scope and ask for key requirements. "
     "If the user asks about previous projects, provide relevant examples from available context. "
     "For follow-up questions, continue in context and avoid repeating generic summaries. "
@@ -478,8 +547,13 @@ def get_retriever():
 
 
 def _retrieve_context_and_score(query: str) -> tuple[str, float]:
+    _ensure_digicoco_knowledge_base_ingested()
     try:
-        matches = get_vectorstore().similarity_search_with_relevance_scores(query, k=5)
+        matches = get_vectorstore().similarity_search_with_relevance_scores(
+            query,
+            k=5,
+            filter={"source": KNOWLEDGE_BASE_SOURCE_NAME},
+        )
     except Exception as retriever_error:
         logger.warning("Retriever lookup failed for score-based retrieval (%s).", retriever_error)
         return "", 0.0
@@ -489,6 +563,10 @@ def _retrieve_context_and_score(query: str) -> tuple[str, float]:
 
 
     for document, score in matches:
+        source_name = str(getattr(document, "metadata", {}).get("source", "") or "")
+        if not _is_digicoco_source(source_name):
+            continue
+
         try:
             score_value = float(score)
         except (TypeError, ValueError):
@@ -546,6 +624,21 @@ async def _generate_completion_with_context(model_input: str, retrieved_context:
 
 async def _stream_answer_tokens(model_input: str, normalized_query: str) -> AsyncGenerator[str, None]:
     retrieved_context, top_score = _retrieve_context_and_score(normalized_query)
+    async for token in _stream_answer_tokens_with_context(
+        model_input=model_input,
+        normalized_query=normalized_query,
+        retrieved_context=retrieved_context,
+        top_score=top_score,
+    ):
+        yield token
+
+
+async def _stream_answer_tokens_with_context(
+    model_input: str,
+    normalized_query: str,
+    retrieved_context: str,
+    top_score: float,
+) -> AsyncGenerator[str, None]:
     use_embedding_context = _should_use_embedding_context(retrieved_context, top_score)
 
     if not use_embedding_context:
@@ -622,26 +715,24 @@ async def _generate_answer(
                 completion_error,
             )
 
-    try:
-        rag_chain = get_rag_chain()
-        response = rag_chain.invoke({"input": model_input})
-        answer = str(response.get("answer", "")).strip()
-        if answer:
-            return answer
-        raise ValueError("Azure OpenAI RAG chain returned an empty answer.")
-    except Exception as rag_error:
-        if direct_answer:
-            logger.warning(
-                "RAG generation failed (%s). Returning direct fallback answer.",
-                rag_error,
-            )
-            return direct_answer
-        raise
+    if direct_answer:
+        return direct_answer
+
+    # Keep responses bounded to DIGICoCo context when no confident retrieval exists.
+    return (
+        "I could not find enough DIGICoCo knowledge-base context for that question. "
+        "Please ask about DIGICoCo services, projects, technologies, or share a more specific query."
+    )
 
 
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok"}
+
+
+@app.on_event("startup")
+async def _startup_ingestion() -> None:
+    _ensure_digicoco_knowledge_base_ingested()
 
 
 @app.post("/api/chat/text")
@@ -652,10 +743,41 @@ async def text_chat(
     try:
         normalized_query = _normalize_user_query(query)
         effective_session_id = _normalize_session_id(session_id)
+        direct_answer = _direct_company_answer(normalized_query)
+        if direct_answer:
+            _save_conversation_turn(effective_session_id, normalized_query, direct_answer)
+            _append_pipeline_log(
+                session_id=effective_session_id,
+                user_query=normalized_query,
+                ai_search={"knowledge_source": KNOWLEDGE_BASE_SOURCE_NAME, "mode": "direct"},
+                ai_response=direct_answer,
+                outcome="success",
+            )
+            return {
+                "reply": direct_answer,
+                "session_id": effective_session_id,
+            }
 
         model_input = _build_model_input(effective_session_id, normalized_query)
-        answer = await _generate_answer(model_input, normalized_query)
+        retrieved_context, top_score = _retrieve_context_and_score(normalized_query)
+        answer = await _generate_answer(
+            model_input,
+            normalized_query,
+            retrieved_context=retrieved_context,
+            top_score=top_score,
+        )
         _save_conversation_turn(effective_session_id, normalized_query, answer)
+        _append_pipeline_log(
+            session_id=effective_session_id,
+            user_query=normalized_query,
+            ai_search={
+                "knowledge_source": KNOWLEDGE_BASE_SOURCE_NAME,
+                "top_score": top_score,
+                "context_found": bool(retrieved_context),
+            },
+            ai_response=answer,
+            outcome="success",
+        )
 
 
         return {
@@ -663,6 +785,13 @@ async def text_chat(
             "session_id": effective_session_id,
         }
     except Exception as error:
+        _append_pipeline_log(
+            session_id=_normalize_session_id(session_id),
+            user_query=_normalize_user_query(query),
+            ai_search={"knowledge_source": KNOWLEDGE_BASE_SOURCE_NAME},
+            outcome="error",
+            error=f"{type(error).__name__}: {str(error)}",
+        )
         logger.exception("Text chat pipeline failed")
         raise HTTPException(
             status_code=500,
@@ -680,13 +809,41 @@ async def text_chat_stream(
 ) -> StreamingResponse:
     normalized_query = _normalize_user_query(query)
     effective_session_id = _normalize_session_id(session_id)
+    direct_answer = _direct_company_answer(normalized_query)
     model_input = _build_model_input(effective_session_id, normalized_query)
 
     async def event_generator() -> AsyncGenerator[str, None]:
         answer_parts: list[str] = []
+        retrieved_context = ""
+        top_score = 0.0
 
         try:
-            async for token in _stream_answer_tokens(model_input, normalized_query):
+            if direct_answer:
+                _save_conversation_turn(effective_session_id, normalized_query, direct_answer)
+                _append_pipeline_log(
+                    session_id=effective_session_id,
+                    user_query=normalized_query,
+                    ai_search={"knowledge_source": KNOWLEDGE_BASE_SOURCE_NAME, "mode": "direct"},
+                    ai_response=direct_answer,
+                    outcome="success",
+                )
+                yield _sse_event("token", {"token": direct_answer})
+                yield _sse_event(
+                    "done",
+                    {
+                        "reply": direct_answer,
+                        "session_id": effective_session_id,
+                    },
+                )
+                return
+
+            retrieved_context, top_score = _retrieve_context_and_score(normalized_query)
+            async for token in _stream_answer_tokens_with_context(
+                model_input=model_input,
+                normalized_query=normalized_query,
+                retrieved_context=retrieved_context,
+                top_score=top_score,
+            ):
                 if not token:
 
                     continue
@@ -701,6 +858,17 @@ async def text_chat_stream(
 
 
             _save_conversation_turn(effective_session_id, normalized_query, final_answer)
+            _append_pipeline_log(
+                session_id=effective_session_id,
+                user_query=normalized_query,
+                ai_search={
+                    "knowledge_source": KNOWLEDGE_BASE_SOURCE_NAME,
+                    "top_score": top_score,
+                    "context_found": bool(retrieved_context),
+                },
+                ai_response=final_answer,
+                outcome="success",
+            )
 
             yield _sse_event(
                 "done",
@@ -710,6 +878,13 @@ async def text_chat_stream(
                 },
             )
         except Exception as error:
+            _append_pipeline_log(
+                session_id=effective_session_id,
+                user_query=normalized_query,
+                ai_search={"knowledge_source": KNOWLEDGE_BASE_SOURCE_NAME},
+                outcome="error",
+                error=f"{type(error).__name__}: {str(error)}",
+            )
             logger.exception("Text chat streaming pipeline failed")
             yield _sse_event(
                 "error",
@@ -816,9 +991,38 @@ async def voice_chat(
             raise HTTPException(status_code=400, detail="Could not transcribe user audio.")
 
         effective_session_id = _normalize_session_id(x_session_id)
-        model_input = _build_model_input(effective_session_id, user_text)
-        bot_reply_text = await _generate_answer(model_input, user_text)
-        _save_conversation_turn(effective_session_id, user_text, bot_reply_text)
+        direct_answer = _direct_company_answer(user_text)
+        if direct_answer:
+            _save_conversation_turn(effective_session_id, user_text, direct_answer)
+            _append_pipeline_log(
+                session_id=effective_session_id,
+                user_query=user_text,
+                ai_search={"knowledge_source": KNOWLEDGE_BASE_SOURCE_NAME, "mode": "direct"},
+                ai_response=direct_answer,
+                outcome="success",
+            )
+            bot_reply_text = direct_answer
+        else:
+            model_input = _build_model_input(effective_session_id, user_text)
+            retrieved_context, top_score = _retrieve_context_and_score(user_text)
+            bot_reply_text = await _generate_answer(
+                model_input,
+                user_text,
+                retrieved_context=retrieved_context,
+                top_score=top_score,
+            )
+            _save_conversation_turn(effective_session_id, user_text, bot_reply_text)
+            _append_pipeline_log(
+                session_id=effective_session_id,
+                user_query=user_text,
+                ai_search={
+                    "knowledge_source": KNOWLEDGE_BASE_SOURCE_NAME,
+                    "top_score": top_score,
+                    "context_found": bool(retrieved_context),
+                },
+                ai_response=bot_reply_text,
+                outcome="success",
+            )
 
 
         communicate = edge_tts.Communicate(bot_reply_text, _get_tts_voice())
@@ -842,6 +1046,13 @@ async def voice_chat(
     except HTTPException:
         raise
     except Exception as error:
+        _append_pipeline_log(
+            session_id=_normalize_session_id(x_session_id),
+            user_query=input_filename,
+            ai_search={"knowledge_source": KNOWLEDGE_BASE_SOURCE_NAME},
+            outcome="error",
+            error=f"{type(error).__name__}: {str(error)}",
+        )
         logger.exception("Voice pipeline failed")
         raise HTTPException(
             status_code=500,
@@ -867,6 +1078,19 @@ async def get_last_chat_turn(session_id: str) -> dict:
         "session_id": effective_session_id,
         "user_query": user_text,
         "reply": bot_reply_text,
+    }
+
+
+@app.get("/api/chat/logs")
+async def get_chat_logs(limit: int = 10) -> dict:
+    safe_limit = max(1, min(limit, 100))
+    with _pipeline_log_lock:
+        logs = list(_pipeline_logs)[-safe_limit:]
+
+    return {
+        "knowledge_source": KNOWLEDGE_BASE_SOURCE_NAME,
+        "recent_user_prompts": _get_recent_user_prompts(limit=10),
+        "logs": logs,
     }
 
 
