@@ -34,7 +34,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
 from openai import AsyncAzureOpenAI, AzureOpenAI
 from supabase import create_client
-import pandas as pd
+import csv
 import io
 import smtplib
 from email.message import EmailMessage
@@ -416,9 +416,10 @@ def _generate_daily_report_and_send() -> None:
             conv_lines.append(f"{label}: {m.get('content')}")
         excel_rows.append({"name": entry.get("name"), "email": entry.get("email"), "session_id": entry.get("session_id"), "conversation": "\n".join(conv_lines)})
 
-    df = pd.DataFrame(excel_rows, columns=["name", "email", "session_id", "conversation"])
-    output = io.BytesIO()
-    df.to_excel(output, index=False, engine="openpyxl")
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=["name", "email", "session_id", "conversation"])
+    writer.writeheader()
+    writer.writerows(excel_rows)
     output.seek(0)
 
     # Send email with attachment via SMTP if configured
@@ -437,7 +438,7 @@ def _generate_daily_report_and_send() -> None:
         msg["From"] = smtp_user
         msg["To"] = recipient
         msg.set_content("Attached is the latest chatbot conversation report in human-readable format (Name, Email, Session ID, Conversation).")
-        msg.add_attachment(output.read(), maintype="application", subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename=f"conversations_{now.strftime('%Y%m%d_%H%M%S')}.xlsx")
+        msg.add_attachment(output.read().encode('utf-8'), maintype="text", subtype="csv", filename=f"conversations_{now.strftime('%Y%m%d_%H%M%S')}.csv")
 
         if smtp_port == 465:
             server = smtplib.SMTP_SSL(smtp_host, smtp_port)
