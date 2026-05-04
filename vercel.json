@@ -10,5 +10,11 @@
         "entrypoint": "backend",
         "routePrefix": "/backend"
       }
-    }
+    },
+    "crons": [
+      {
+        "path": "/backend/api/cron/daily-report",
+        "schedule": "0 0 * * *"
+      }
+    ]
   }

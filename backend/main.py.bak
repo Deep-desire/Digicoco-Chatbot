@@ -38,6 +38,7 @@ import pandas as pd
 import io
 import smtplib
 from email.message import EmailMessage
+from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import timedelta
 
 from langchain_pinecone import PineconeVectorStore
@@ -456,10 +457,27 @@ def _generate_daily_report_and_send() -> None:
 
 
 # Start Supabase client and scheduler
-@app.get('/api/cron/daily-report')
-def trigger_daily_report() -> dict:
-    _generate_daily_report_and_send()
-    return {"status": "ok", "message": "Daily report generation triggered."}
+_scheduler: BackgroundScheduler | None = None
+
+def _start_daily_report_scheduler() -> None:
+    global _scheduler
+    _init_supabase_client()
+    # If already running, skip
+    if _scheduler:
+        return
+    _scheduler = BackgroundScheduler()
+    # run every 24 hours
+    _scheduler.add_job(
+        _generate_daily_report_and_send,
+        'interval',
+        hours=24,
+        id='chat_report_24_hours',
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+    _scheduler.start()
+    logger.info("Report scheduler started: every 24 hours")
 
 
 def _sanitize_header_value(value: str, *, max_chars: int = 700) -> str:
@@ -1303,6 +1321,11 @@ async def _startup_ingestion() -> None:
     run_on_startup = os.getenv("AUTO_INGEST_DIGICOCO_KB_ON_STARTUP", "false").lower() == "true"
     if not run_on_startup:
         logger.info("Skipping DIGICoCo knowledge-base ingestion at startup for faster boot.")
+        # still start the daily report scheduler even if ingestion is skipped
+        try:
+            _start_daily_report_scheduler()
+        except Exception:
+            logger.exception("Failed to start daily report scheduler")
         return
 
     def _ingest_in_background() -> None:
@@ -1312,6 +1335,10 @@ async def _startup_ingestion() -> None:
             logger.warning("Background startup ingestion failed: %s", startup_ingest_error)
 
     Thread(target=_ingest_in_background, daemon=True).start()
+    try:
+        _start_daily_report_scheduler()
+    except Exception:
+        logger.exception("Failed to start daily report scheduler")
 
 
 @app.post("/api/chat/text")
