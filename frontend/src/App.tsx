@@ -44,7 +44,19 @@ const resolveApiBaseUrl = (): string => {
 
 const API_BASE_URL = resolveApiBaseUrl();
 const SESSION_STORAGE_KEY = 'chatbot_session_id';
-const FLOATING_BOT_IMAGE_URL = import.meta.env.VITE_FLOATING_BOT_IMAGE_URL || '';
+
+const ChatBotIcon = ({ className }: { className?: string }) => (
+  <svg className={className} viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+    <rect x="20" y="30" width="160" height="120" rx="20" fill="var(--vtl-primary)"/>
+    <polygon points="60,150 80,150 65,170" fill="var(--vtl-primary)"/>
+    <rect x="50" y="50" width="100" height="80" rx="15" fill="#FFFFFF"/>
+    <circle cx="80" cy="85" r="8" fill="var(--vtl-primary)"/>
+    <circle cx="120" cy="85" r="8" fill="var(--vtl-primary)"/>
+    <rect x="75" y="105" width="50" height="8" rx="4" fill="var(--vtl-primary)"/>
+    <line x1="100" y1="50" x2="100" y2="30" stroke="#FFFFFF" strokeWidth="4"/>
+    <circle cx="100" cy="25" r="5" fill="#FFFFFF"/>
+  </svg>
+);
 
 const decodeHeaderValue = (value: string | null): string => {
   if (!value) {
@@ -630,8 +642,6 @@ function App() {
     void startRecording();
   };
 
-  const showFloatingImage = !isOpen && !!FLOATING_BOT_IMAGE_URL && !floatingImageError;
-
   return (
     <>
       <button
@@ -639,22 +649,15 @@ function App() {
         className={`fixed z-50 transition-transform hover:scale-105 flex items-center justify-center ${
           isOpen ? 'top-3 right-3 sm:top-auto sm:bottom-6 sm:right-6' : 'bottom-4 right-4 sm:bottom-6 sm:right-6'
         } ${
-          showFloatingImage
+          !isOpen
             ? 'w-16 h-16 sm:w-[110px] sm:h-[110px] rounded-full bg-transparent shadow-none overflow-hidden p-0'
             : 'p-3 sm:p-4 bg-[var(--vtl-primary)] text-white rounded-full shadow-2xl hover:brightness-95'
         }`}
       >
         {isOpen ? (
           <X className="w-5 h-5 sm:w-6 sm:h-6" />
-        ) : showFloatingImage ? (
-          <img
-            src={FLOATING_BOT_IMAGE_URL}
-            alt="Assistant"
-            className="w-full h-full object-cover object-center rounded-full"
-            onError={() => setFloatingImageError(true)}
-          />
         ) : (
-          <MessageCircle className="w-5 h-5 sm:w-6 sm:h-6" />
+          <ChatBotIcon className="w-full h-full object-contain rounded-full" />
         )}
       </button>
 
