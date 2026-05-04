@@ -22,6 +22,11 @@ from fastapi import Body, FastAPI, File, Form, Header, HTTPException, Query, Upl
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from groq import Groq
+
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from ingestion import ingest_file
 from langchain.chains import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
