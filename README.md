@@ -46,3 +46,6 @@ npm run dev
 # visit2lead-updated
 # visit2lead-updated
 # v2lead
+
+logs url:-
+http://localhost:8000/api/chat/logs?limit=10

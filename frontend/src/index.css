@@ -3,17 +3,16 @@
 @tailwind utilities;
 
 :root {
-	--vtl-primary: #0f4fc0;
-	--vtl-secondary: #2a67d1;
-	--vtl-accent: #7ea9ff;
-	--vtl-text: #14213d;
-	--vtl-muted: #5b6b84;
+	--vtl-primary: #057cbf;
+	--vtl-secondary: #0992da;
+	--vtl-accent: #69c9ef;
+	--vtl-text: #0d2f45;
+	--vtl-muted: #4c6b7e;
 	--vtl-panel: #ffffff;
-	--vtl-surface: #f4f8ff;
-	--vtl-border: #d8e4f8;
-	--vtl-chip-bg: #e9f0ff;
-	--vtl-chip-hover: #d9e6ff;
-	--vtl-gradient: linear-gradient(135deg, #3b86f1 0%, #2566d0 55%, #1c4fb0 100%);
+	--vtl-surface: #f1f9fe;
+	--vtl-border: #cfe7f5;
+	--vtl-chip-bg: #e2f2fb;
+	--vtl-chip-hover: #d2ebf9;
 }
 
 html,
@@ -26,10 +25,6 @@ body,
 
 body {
 	overflow-x: hidden;
-}
-
-.vtl-brand-gradient {
-	background-image: var(--vtl-gradient);
 }
 
 .vtl-markdown {

@@ -11,7 +11,22 @@ interface Message {
   isAudio?: boolean;
 }
 
-type LeadStage = 'chat';
+type LeadStep = 'email' | 'name' | 'chat';
+
+type BrowserSpeechRecognition = {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onresult: ((event: {
+    resultIndex: number;
+    results: ArrayLike<ArrayLike<{ transcript: string }>>;
+  }) => void) | null;
+  onerror: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+};
+
+type BrowserSpeechRecognitionCtor = new () => BrowserSpeechRecognition;
 
 
 const resolveApiBaseUrl = (): string => {
@@ -28,9 +43,8 @@ const resolveApiBaseUrl = (): string => {
 };
 
 const API_BASE_URL = resolveApiBaseUrl();
+const SESSION_STORAGE_KEY = 'chatbot_session_id';
 const FLOATING_BOT_IMAGE_URL = import.meta.env.VITE_FLOATING_BOT_IMAGE_URL || '';
-
-const SESSION_STORAGE_KEY = 'vtl_session_id';
 
 const decodeHeaderValue = (value: string | null): string => {
   if (!value) {
@@ -53,6 +67,8 @@ const normalizeMarkdownText = (text: string): string => {
   return normalized;
 };
 
+const isValidEmail = (email: string): boolean => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
+
 function MarkdownMessage({ text }: { text: string }) {
   return (
     <ReactMarkdown
@@ -67,10 +83,6 @@ function MarkdownMessage({ text }: { text: string }) {
     </ReactMarkdown>
   );
 }
-
-const isValidEmail = (email: string): boolean => {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
-};
 
 const createSessionId = (): string => {
   if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
@@ -87,32 +99,59 @@ function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [isStreamingResponse, setIsStreamingResponse] = useState(false);
   const [isWaitingForFirstToken, setIsWaitingForFirstToken] = useState(false);
+  const [isVoiceRequestInFlight, setIsVoiceRequestInFlight] = useState(false);
   const [floatingImageError, setFloatingImageError] = useState(false);
 
   const [sessionId, setSessionId] = useState('');
-  const [leadStage, setLeadStage] = useState<LeadStage>('chat');
+  const [leadStep, setLeadStep] = useState<LeadStep>('email');
+  const [userEmail, setUserEmail] = useState('');
+  const [userName, setUserName] = useState('');
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
+  const recordingStartedAtRef = useRef<number>(0);
+  const isStoppingRecordingRef = useRef(false);
+  const pendingVoiceTurnRef = useRef<{ userIndex: number; botIndex: number } | null>(null);
+  const speechRecognitionRef = useRef<BrowserSpeechRecognition | null>(null);
+  const liveVoiceTranscriptRef = useRef('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const storedSessionId = localStorage.getItem(SESSION_STORAGE_KEY)?.trim();
+    if (storedSessionId) {
+      // try to restore session from backend
+      (async () => {
+        try {
+          const res = await fetch(`${API_BASE_URL}/api/session/${encodeURIComponent(storedSessionId)}`);
+          if (res.ok) {
+            const data = await res.json();
+            setSessionId(storedSessionId);
+            setUserEmail(data.email || '');
+            setUserName(data.name || '');
+            setLeadStep('chat');
+            setMessages([{ role: 'bot', text: `Welcome back, ${data.name || 'friend'}! How can I help you today?` }]);
+            return;
+          }
+        } catch (e) {
+          // fall back to fresh lead flow
+          // console.warn('Session restore failed', e);
+        }
+        // no valid session
+        setSessionId(createSessionId());
+        setLeadStep('email');
+        setUserEmail('');
+        setUserName('');
+        setMessages([{ role: 'bot', text: 'Hi! Before we begin, please share your email address.' }]);
+      })();
+      return;
+    }
 
-    const resolvedSessionId = storedSessionId || createSessionId();
-    setSessionId(resolvedSessionId);
-    localStorage.setItem(SESSION_STORAGE_KEY, resolvedSessionId);
-
-    setLeadStage('chat');
-    setMessages([
-      {
-        role: 'bot',
-        text: `Welcome! How can I help you today?`,
-      },
-    ]);
+    setSessionId(createSessionId());
+    setLeadStep('email');
+    setUserEmail('');
+    setUserName('');
+    setMessages([{ role: 'bot', text: 'Hi! Before we begin, please share your email address.' }]);
   }, []);
-
-  // Storage logic for email/name removed
 
 
   useEffect(() => {
@@ -156,10 +195,57 @@ function App() {
       return;
     }
 
+    if (leadStep !== 'chat') {
+      const leadInput = rawMessage.trim();
+
+      if (leadStep === 'email') {
+        if (!isValidEmail(leadInput)) {
+          setMessages((prev) => [...prev, { role: 'bot', text: 'Please enter a valid email address.' }]);
+          return;
+        }
+
+        setUserEmail(leadInput);
+        setMessages((prev) => [
+          ...prev,
+          { role: 'user', text: leadInput },
+          { role: 'bot', text: 'Thanks! Now please share your name.' },
+        ]);
+        setLeadStep('name');
+        return;
+      }
+
+      if (leadStep === 'name') {
+        setUserName(leadInput);
+        // register session on backend (creates session row and user)
+        try {
+          const res = await fetch(`${API_BASE_URL}/api/session/register`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email: userEmail, name: leadInput, session_id: sessionId || undefined }),
+          });
+          if (res.ok) {
+            const data = await res.json();
+            const sid = data.session_id || sessionId || `s_${crypto?.randomUUID?.() || Math.random().toString(36).slice(2)}`;
+            localStorage.setItem(SESSION_STORAGE_KEY, sid);
+            setSessionId(sid);
+          }
+        } catch (e) {
+          // ignore — session may still work in-memory
+          console.error('Session register failed', e);
+        }
+
+        setMessages((prev) => [
+          ...prev,
+          { role: 'user', text: leadInput },
+          { role: 'bot', text: `Nice to meet you, ${leadInput}. How can I help you today?` },
+        ]);
+        setLeadStep('chat');
+        return;
+      }
+    }
+
     const userMsg = rawMessage.trim();
     setMessages((prev) => [...prev, { role: 'user', text: userMsg }]);
-
-    // Email and Name stage logic removed
 
 
     setIsLoading(true);
@@ -172,9 +258,14 @@ function App() {
       formData.append('query', userMsg);
       formData.append('session_id', sessionId);
 
+      const headers: Record<string, string> = {};
+      if (userEmail) headers['X-User-Email'] = userEmail;
+      if (userName) headers['X-User-Name'] = userName;
+
       const response = await fetch(`${API_BASE_URL}/api/chat/text/stream`, {
         method: 'POST',
         body: formData,
+        headers,
       });
 
       if (!response.ok || !response.body) {
@@ -299,11 +390,6 @@ function App() {
       if (!streamedText.trim()) {
         throw new Error('Empty streamed response');
       }
-
-      if (resolvedSessionId !== sessionId) {
-        setSessionId(resolvedSessionId);
-        localStorage.setItem(SESSION_STORAGE_KEY, resolvedSessionId);
-      }
     } catch {
       setLatestBotMessageText('Sorry, an error occurred while streaming the response.');
     } finally {
@@ -325,15 +411,22 @@ function App() {
   };
 
   const startRecording = async () => {
-    if (isLoading || isRecording || leadStage !== 'chat') {
+    if (isLoading || isRecording || leadStep !== 'chat') {
       return;
     }
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mediaRecorder = new MediaRecorder(stream);
+      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : (MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : '');
+      const mediaRecorder = mimeType
+        ? new MediaRecorder(stream, { mimeType })
+        : new MediaRecorder(stream);
       mediaRecorderRef.current = mediaRecorder;
       audioChunksRef.current = [];
+      recordingStartedAtRef.current = Date.now();
+      isStoppingRecordingRef.current = false;
 
       mediaRecorder.ondataavailable = (event: BlobEvent) => {
         if (event.data.size > 0) {
@@ -343,6 +436,43 @@ function App() {
 
       mediaRecorder.onstop = handleAudioStop;
       mediaRecorder.start();
+
+      const speechCtor = (
+        window as Window & {
+          SpeechRecognition?: BrowserSpeechRecognitionCtor;
+          webkitSpeechRecognition?: BrowserSpeechRecognitionCtor;
+        }
+      ).SpeechRecognition || (
+        window as Window & {
+          SpeechRecognition?: BrowserSpeechRecognitionCtor;
+          webkitSpeechRecognition?: BrowserSpeechRecognitionCtor;
+        }
+      ).webkitSpeechRecognition;
+
+      if (speechCtor) {
+        const recognizer = new speechCtor();
+        recognizer.continuous = true;
+        recognizer.interimResults = true;
+        recognizer.lang = 'en-US';
+        recognizer.onresult = (event) => {
+          let transcript = '';
+          for (let i = event.resultIndex; i < event.results.length; i += 1) {
+            transcript += event.results[i][0]?.transcript || '';
+          }
+          liveVoiceTranscriptRef.current = transcript.trim() || liveVoiceTranscriptRef.current;
+        };
+        recognizer.onerror = () => {
+          speechRecognitionRef.current = null;
+        };
+
+        try {
+          recognizer.start();
+          speechRecognitionRef.current = recognizer;
+        } catch {
+          speechRecognitionRef.current = null;
+        }
+      }
+
       setIsRecording(true);
     } catch {
       alert('Please allow microphone access to use voice features.');
@@ -350,17 +480,70 @@ function App() {
   };
 
   const stopRecording = () => {
-    if (mediaRecorderRef.current && isRecording) {
+    if (!mediaRecorderRef.current || !isRecording || isStoppingRecordingRef.current) {
+      return;
+    }
+
+    if (mediaRecorderRef.current.state !== 'inactive') {
+      isStoppingRecordingRef.current = true;
       mediaRecorderRef.current.stop();
+      speechRecognitionRef.current?.stop();
+      speechRecognitionRef.current = null;
       setIsRecording(false);
       mediaRecorderRef.current.stream.getTracks().forEach((track) => track.stop());
     }
   };
 
+  const updatePendingVoiceTurn = (userText: string, botText: string) => {
+    setMessages((prev) => {
+      const turn = pendingVoiceTurnRef.current;
+      if (!turn) {
+        return [...prev, { role: 'user', text: userText, isAudio: true }, { role: 'bot', text: botText, isAudio: true }];
+      }
+
+      if (
+        turn.userIndex >= 0 &&
+        turn.botIndex >= 0 &&
+        prev[turn.userIndex]?.role === 'user' &&
+        prev[turn.userIndex]?.isAudio &&
+        prev[turn.botIndex]?.role === 'bot' &&
+        prev[turn.botIndex]?.isAudio
+      ) {
+        const next = [...prev];
+        next[turn.userIndex] = { ...next[turn.userIndex], text: userText };
+        next[turn.botIndex] = { ...next[turn.botIndex], text: botText };
+        return next;
+      }
+
+      return [...prev, { role: 'user', text: userText, isAudio: true }, { role: 'bot', text: botText, isAudio: true }];
+    });
+  };
+
   const handleAudioStop = async () => {
+    const recordingDurationMs = Date.now() - recordingStartedAtRef.current;
+    const chunkType = audioChunksRef.current[0]?.type || 'audio/webm';
+    const audioBlob = new Blob(audioChunksRef.current, { type: chunkType });
+    if (audioBlob.size === 0 || recordingDurationMs < 300) {
+      isStoppingRecordingRef.current = false;
+      setMessages((prev) => [...prev, { role: 'bot', text: 'Recording is too short. Please hold the mic and try again.' }]);
+      return;
+    }
+
     setIsLoading(true);
-    const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
-    const audioFile = new File([audioBlob], 'recording.webm', { type: 'audio/webm' });
+    setIsVoiceRequestInFlight(true);
+    if (liveVoiceTranscriptRef.current.trim()) {
+      setMessages((prev) => {
+        const userIndex = prev.length;
+        const botIndex = prev.length + 1;
+        pendingVoiceTurnRef.current = { userIndex, botIndex };
+        return [
+          ...prev,
+          { role: 'user', text: liveVoiceTranscriptRef.current.trim(), isAudio: true },
+          { role: 'bot', text: '', isAudio: true },
+        ];
+      });
+    }
+    const audioFile = new File([audioBlob], 'recording.webm', { type: chunkType });
 
     const formData = new FormData();
     formData.append('audio', audioFile);
@@ -370,6 +553,8 @@ function App() {
         method: 'POST',
         headers: {
           'X-Session-Id': sessionId,
+          ...(userEmail ? { 'X-User-Email': userEmail } : {}),
+          ...(userName ? { 'X-User-Name': userName } : {}),
         },
         body: formData,
       });
@@ -385,6 +570,19 @@ function App() {
         || response.headers.get('X-Bot-Reply')
         || 'Audio Reply';
 
+      if (!pendingVoiceTurnRef.current) {
+        setMessages((prev) => {
+          const userIndex = prev.length;
+          const botIndex = prev.length + 1;
+          pendingVoiceTurnRef.current = { userIndex, botIndex };
+          return [
+            ...prev,
+            { role: 'user', text: userQuery, isAudio: true },
+            { role: 'bot', text: '', isAudio: true },
+          ];
+        });
+      }
+
       try {
         const lastTurnResponse = await axios.get(`${API_BASE_URL}/api/chat/last`, {
           params: { session_id: sessionId },
@@ -395,27 +593,42 @@ function App() {
         // Keep header-based fallbacks when last-turn lookup is unavailable.
       }
 
-      setMessages((prev) => [
-        ...prev,
-        { role: 'user', text: userQuery, isAudio: true },
-        { role: 'bot', text: botReply, isAudio: true },
-      ]);
+      updatePendingVoiceTurn(userQuery || 'Voice Message', botReply || 'Audio Reply');
 
       const audioResponseBlob = await response.blob();
-      const audioUrl = URL.createObjectURL(audioResponseBlob);
-      const audio = new Audio(audioUrl);
-      await audio.play();
-      audio.onended = () => URL.revokeObjectURL(audioUrl);
+      if (audioResponseBlob.size > 0) {
+        const audioUrl = URL.createObjectURL(audioResponseBlob);
+        const audio = new Audio(audioUrl);
+        try {
+          await audio.play();
+        } catch {
+          // Keep text response visible even when autoplay is blocked.
+        }
+        audio.onended = () => URL.revokeObjectURL(audioUrl);
+      }
     } catch {
-      setMessages((prev) => [...prev, { role: 'bot', text: 'Sorry, failed to process audio.' }]);
+      updatePendingVoiceTurn('Voice Message', 'Sorry, failed to process audio.');
     } finally {
+      audioChunksRef.current = [];
+      isStoppingRecordingRef.current = false;
+      pendingVoiceTurnRef.current = null;
+      liveVoiceTranscriptRef.current = '';
+      setIsVoiceRequestInFlight(false);
       setIsLoading(false);
     }
   };
 
   const voiceHintText = isRecording
-    ? '🔴 Recording... release to send'
-    : 'Hold mic to record • Release to send';
+    ? '🔴 Recording... tap again to send'
+    : 'Tap mic to record • Tap again to send';
+
+  const handleVoiceButtonClick = () => {
+    if (isRecording) {
+      stopRecording();
+      return;
+    }
+    void startRecording();
+  };
 
   const showFloatingImage = !isOpen && !!FLOATING_BOT_IMAGE_URL && !floatingImageError;
 
@@ -428,7 +641,7 @@ function App() {
         } ${
           showFloatingImage
             ? 'w-16 h-16 sm:w-[110px] sm:h-[110px] rounded-full bg-transparent shadow-none overflow-hidden p-0'
-            : 'p-3 sm:p-4 vtl-brand-gradient text-white rounded-full shadow-2xl hover:brightness-95'
+            : 'p-3 sm:p-4 bg-[var(--vtl-primary)] text-white rounded-full shadow-2xl hover:brightness-95'
         }`}
       >
         {isOpen ? (
@@ -447,10 +660,10 @@ function App() {
 
       {isOpen && (
         <div className="fixed inset-x-0 top-0 bottom-0 sm:inset-auto sm:bottom-24 sm:right-6 z-40 w-full sm:w-[min(540px,94vw)] h-full sm:h-[760px] sm:max-h-[85vh] bg-[var(--vtl-panel)] rounded-none sm:rounded-2xl shadow-2xl flex flex-col border border-[var(--vtl-border)] overflow-hidden">
-          <div className="vtl-brand-gradient p-3 sm:p-4 text-white font-bold text-base sm:text-lg flex justify-between items-center shadow-md z-10">
+          <div className="bg-[var(--vtl-primary)] p-3 sm:p-4 text-white font-bold text-base sm:text-lg flex justify-between items-center shadow-md z-10">
             <div className="flex items-center gap-2">
               <div className="w-2 h-2 bg-[var(--vtl-accent)] rounded-full animate-pulse"></div>
-              <span>DIGICoCo Assistant</span>
+              <span>DIGIC Assistant</span>
             </div>
           </div>
 
@@ -463,7 +676,7 @@ function App() {
                   }`}
                 >
                   {msg.isAudio && <span className="text-xs opacity-75 block mb-1">🎤 Voice</span>}
-                  {msg.role === 'bot' && msg.text.trim().length === 0 && isStreamingResponse && isLoading && isWaitingForFirstToken && idx === messages.length - 1 ? (
+                  {msg.role === 'bot' && msg.text.trim().length === 0 && isLoading && idx === messages.length - 1 ? (
                     <div className="flex items-center gap-2 text-[var(--vtl-muted)]">
                       <Loader2 className="w-4 h-4 animate-spin" />
                       <span>Thinking...</span>
@@ -477,7 +690,7 @@ function App() {
               </div>
             ))}
 
-            {isLoading && !isStreamingResponse && (
+            {isLoading && !isStreamingResponse && !isVoiceRequestInFlight && !(messages.length > 0 && messages[messages.length - 1]?.role === 'bot' && messages[messages.length - 1]?.text.trim().length === 0) && (
               <div className="flex justify-start">
                 <div className="bg-[var(--vtl-panel)] border border-[var(--vtl-border)] p-3 rounded-2xl rounded-bl-none flex items-center gap-2 text-[var(--vtl-muted)] text-sm">
                   <Loader2 className="w-4 h-4 animate-spin" /> Thinking...
@@ -494,18 +707,14 @@ function App() {
 
             <div className="flex items-center gap-2">
             <button
-              onMouseDown={startRecording}
-              onMouseUp={stopRecording}
-              onMouseLeave={stopRecording}
-              onTouchStart={startRecording}
-              onTouchEnd={stopRecording}
-              title="Hold to record voice message, release to send"
+              onClick={handleVoiceButtonClick}
+              title={isRecording ? 'Tap to stop and send voice message' : 'Tap to start recording voice message'}
               className={`p-2 sm:p-2.5 rounded-full flex-shrink-0 ${
                 isRecording
                   ? 'bg-red-500 text-white animate-pulse'
                   : 'bg-[var(--vtl-chip-bg)] text-[var(--vtl-primary)] hover:bg-[var(--vtl-chip-hover)] disabled:opacity-50 disabled:cursor-not-allowed'
               }`}
-              disabled={leadStage !== 'chat' || isLoading}
+              disabled={isLoading || leadStep !== 'chat'}
             >
               <Mic className="w-4 h-4 sm:w-5 sm:h-5" />
             </button>
@@ -515,15 +724,15 @@ function App() {
                 type="text"
                 value={inputText}
                 onChange={(e) => setInputText(e.target.value)}
-                placeholder="Message..."
+                placeholder={leadStep === 'email' ? 'Email address' : leadStep === 'name' ? 'Your name' : 'Message...'}
                 className="flex-1 min-w-0 px-3 sm:px-4 py-2 text-sm rounded-full bg-[var(--vtl-chip-bg)] text-[var(--vtl-text)] border border-transparent focus:bg-white focus:border-[var(--vtl-secondary)] outline-none"
                 disabled={isRecording || isLoading}
               />
               <button
                 type="submit"
-                title="Send message"
+                title={leadStep === 'chat' ? 'Send message' : 'Continue'}
                 disabled={!inputText.trim() || isRecording || isLoading}
-                className="p-2 sm:p-2.5 vtl-brand-gradient text-white rounded-full hover:brightness-95 disabled:opacity-50"
+                className="p-2 sm:p-2.5 bg-[var(--vtl-primary)] text-white rounded-full hover:brightness-95 disabled:opacity-50"
               >
                 <Send className="w-4 h-4" />
               </button>

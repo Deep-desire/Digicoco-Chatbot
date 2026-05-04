@@ -4,6 +4,7 @@ import shutil
 import uuid
 import logging
 import json
+import asyncio
 from datetime import datetime, timezone
 from collections import deque
 from functools import lru_cache
@@ -17,7 +18,7 @@ from urllib.parse import quote
 
 import edge_tts
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from groq import Groq
@@ -27,13 +28,32 @@ from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
 from openai import AsyncAzureOpenAI, AzureOpenAI
+from supabase import create_client
+import pandas as pd
+import io
+import smtplib
+from email.message import EmailMessage
+from apscheduler.schedulers.background import BackgroundScheduler
+from datetime import timedelta
 
 from langchain_pinecone import PineconeVectorStore
 from pinecone import Pinecone, ServerlessSpec
 from pinecone.core.client.exceptions import NotFoundException
 
+try:
+    import av
+    import numpy as np
+    from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
+except Exception:  # pragma: no cover - optional runtime dependency
+    av = None
+    np = None
+    RTCPeerConnection = None
+    RTCSessionDescription = None
+    VideoStreamTrack = object
+
 load_dotenv()
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="Hybrid Voice + Text RAG Chatbot API")
 
@@ -109,10 +129,126 @@ _pipeline_logs: deque[dict[str, Any]] = deque(maxlen=500)
 _digicoco_kb_ready = False
 _digicoco_kb_ingest_attempted = False
 
+_employees_seed: list[dict[str, Any]] = [
+    {"id": 1, "name": "Aarav Sharma", "active": True},
+    {"id": 2, "name": "Neha Patel", "active": True},
+    {"id": 3, "name": "Rohan Mehta", "active": False},
+]
+
+_cameras_seed: list[dict[str, Any]] = [
+    {
+        "id": 1,
+        "camera_id": "cam1",
+        "name": "Main Gate Cam",
+        "location": "Unknown",
+        "source": "",
+        "status": "online",
+        "fps": 0.0,
+        "people": 0,
+    },
+    {
+        "id": 2,
+        "camera_id": "cam2",
+        "name": "Lobby Cam",
+        "location": "Unknown",
+        "source": "",
+        "status": "online",
+        "fps": 0.0,
+        "people": 0,
+    },
+    {
+        "id": 3,
+        "camera_id": "cam3",
+        "name": "Parking Cam",
+        "location": "Unknown",
+        "source": "",
+        "status": "offline",
+        "fps": 0.0,
+        "people": 0,
+    },
+]
+_camera_lock = Lock()
+EMPLOYEE_FACES_DIR = Path("data") / "employee_faces"
+_webrtc_connections: dict[str, set[Any]] = {}
+
+
+def _next_camera_id() -> int:
+    if not _cameras_seed:
+        return 1
+    return max(int(camera.get("id", 0)) for camera in _cameras_seed) + 1
+
+
+def _find_camera_index(camera_id: int) -> int:
+    for index, camera in enumerate(_cameras_seed):
+        if int(camera.get("id", -1)) == camera_id:
+            return index
+    return -1
+
+
+def _find_camera_index_by_ref(camera_ref: str) -> int:
+    normalized_ref = str(camera_ref).strip().lower()
+    for index, camera in enumerate(_cameras_seed):
+        if str(camera.get("id", "")).strip().lower() == normalized_ref:
+            return index
+        if str(camera.get("camera_id", "")).strip().lower() == normalized_ref:
+            return index
+    return -1
+
+
+def _find_camera(camera_ref: str) -> dict[str, Any] | None:
+    normalized_ref = str(camera_ref).strip().lower()
+    for camera in _cameras_seed:
+        if str(camera.get("id", "")).lower() == normalized_ref:
+            return camera
+        if str(camera.get("camera_id", "")).lower() == normalized_ref:
+            return camera
+        if str(camera.get("name", "")).strip().lower() == normalized_ref:
+            return camera
+    return None
+
+
+def _next_employee_id() -> int:
+    if not _employees_seed:
+        return 1
+    return max(int(employee.get("id", 0)) for employee in _employees_seed) + 1
+
+
+class _SyntheticCameraTrack(VideoStreamTrack):
+    def __init__(self, camera_label: str) -> None:
+        super().__init__()
+        self._camera_label = camera_label
+        self._start_time = time()
+
+    async def recv(self):  # type: ignore[override]
+        pts, time_base = await self.next_timestamp()
+        frame_age = int(time() - self._start_time)
+        canvas = np.zeros((720, 1280, 3), dtype=np.uint8)
+        frame = av.VideoFrame.from_ndarray(canvas, format="bgr24")
+        frame.pts = pts
+        frame.time_base = time_base
+        metadata = {
+            "camera": self._camera_label,
+            "uptime_seconds": frame_age,
+            "status": "live-synthetic",
+        }
+        frame.metadata.update({k: str(v) for k, v in metadata.items()})
+        return frame
+
 KNOWLEDGE_BASE_FILE = Path("Knowledge base") / "DIGICoCo_Knowledge_Base.txt"
 KNOWLEDGE_BASE_SOURCE_NAME = KNOWLEDGE_BASE_FILE.name
 KB_CHUNK_SIZE_CHARS = 1800
 KB_CHUNK_OVERLAP_CHARS = 300
+OUT_OF_CONTEXT_FALLBACK = (
+    "Apologise, I might not help you answering this question.\n\n"
+    "I can help with DIGICoCo-related topics such as:\n"
+    "- AI and chatbot services\n"
+    "- Microsoft technology solutions\n"
+    "- Project scope, implementation approach, and support options\n\n"
+    "I don’t have that exact information right now, but I can connect you with the DIGICoCo team who will be able to help you quickly.\n"
+    "You can reach them at:\n"
+    "📧 info@digicoco.co.za\n"
+    "📞 +27 11 656 8528"
+)
 
 
 
@@ -121,6 +257,222 @@ def _get_required_env(name: str) -> str:
     if not value:
         raise ValueError(f"Missing required environment variable: {name}")
     return value
+
+
+# --- Supabase client initialization ---
+_supabase_client = None
+def _init_supabase_client() -> None:
+    global _supabase_client
+    url = os.getenv("NEXT_PUBLIC_SUPABASE_URL")
+    # Prefer service role key for server-side writes (bypasses RLS). Falls back to publishable key (read-only / limited).
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY")
+
+    if not url or not key:
+        logger.warning("Supabase credentials not configured (NEXT_PUBLIC_SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY). Writes will be disabled.")
+        _supabase_client = None
+        return
+
+    try:
+        _supabase_client = create_client(url, key)
+        if os.getenv("SUPABASE_SERVICE_ROLE_KEY"):
+            logger.info("Supabase service-role key detected: server-side writes enabled.")
+        else:
+            logger.warning(
+                "Supabase service-role key not found. Using publishable key — server-side writes may fail due to Row Level Security (RLS)."
+            )
+    except Exception as e:
+        logger.exception("Failed to initialize Supabase client: %s", e)
+        _supabase_client = None
+
+_init_supabase_client()
+
+def _supabase_upsert_user(name: str | None, email: str | None) -> None:
+    if not _supabase_client or not email:
+        return
+    try:
+        payload = {"email": email.strip(), "name": (name or "").strip()}
+        # upsert by email
+        _supabase_client.table("users").upsert(payload).execute()
+    except Exception as e:
+        if "Expecting value" not in str(e):
+            logger.exception("Failed to upsert user into Supabase")
+
+
+def _supabase_insert_message(name: str | None, email: str | None, session_id: str, role: str, content: str, ts: datetime) -> None:
+    if not _supabase_client:
+        return
+    try:
+        payload = {
+            "session_id": session_id,
+            "name": (name or "").strip(),
+            "email": (email or "").strip(),
+            "role": role,
+            "content": content,
+            "timestamp": ts.replace(tzinfo=timezone.utc).isoformat(),
+        }
+        _supabase_client.table("messages").insert(payload).execute()
+    except Exception as e:
+        if "Expecting value" not in str(e):
+            logger.exception("Failed to insert message into Supabase")
+
+
+def _supabase_upsert_session(session_id: str, name: str | None, email: str | None) -> None:
+    """Create or update a session row mapping session_id to user (requires service role key or RLS policy)."""
+    if not _supabase_client or not session_id or not email:
+        return
+    try:
+        payload = {"session_id": session_id, "email": email.strip(), "name": (name or "").strip(), "last_seen_at": datetime.utcnow().isoformat()}
+        _supabase_client.table("sessions").upsert(payload).execute()
+    except Exception as e:
+        if "Expecting value" not in str(e):
+            logger.exception("Failed to upsert session into Supabase")
+
+
+def _supabase_get_session(session_id: str) -> dict | None:
+    if not _supabase_client or not session_id:
+        return None
+    try:
+        resp = _supabase_client.table("sessions").select("*").filter("session_id", "eq", session_id).limit(1).execute()
+        data = resp.data or []
+        if not data:
+            return None
+        return data[0]
+    except Exception:
+        logger.exception("Failed to query session from Supabase")
+        return None
+
+
+def _generate_daily_report_and_send() -> None:
+    """Query Supabase for full conversation history, build an Excel file and email it every 10 minutes."""
+    global _supabase_client
+    
+    # Re-initialize Supabase client if not available (handles thread context issues)
+    if not _supabase_client:
+        logger.info("Reinitializing Supabase client in scheduler thread...")
+        _init_supabase_client()
+    
+    if not _supabase_client:
+        logger.warning("Skipping report: Supabase not configured.")
+        return
+
+    # determine recipient
+    recipient = os.getenv("DAILY_REPORT_RECIPIENT") or os.getenv("REPORT_EMAIL") or os.getenv("ADMIN_EMAIL")
+    if not recipient:
+        logger.warning("No report recipient configured. Set DAILY_REPORT_RECIPIENT or REPORT_EMAIL or ADMIN_EMAIL in .env")
+        return
+
+    now = datetime.utcnow()
+    max_retries = 3
+    retry_delay = 1
+    rows = []
+
+    # Retry logic for querying messages (handles transient network issues)
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Querying Supabase for messages (attempt {attempt + 1}/{max_retries})...")
+            resp = _supabase_client.table("messages").select("*").order("timestamp", desc=False).execute()
+            rows = resp.data or []
+            logger.info(f"Successfully retrieved {len(rows)} messages from Supabase")
+            break  # Success, exit retry loop
+        except Exception as e:
+            logger.warning(f"Failed to query messages (attempt {attempt + 1}/{max_retries}): {str(e)}")
+            if attempt < max_retries - 1:
+                logger.info(f"Retrying in {retry_delay} seconds...")
+                sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+            else:
+                logger.exception("Max retries reached for querying messages")
+                rows = []
+
+    if not rows:
+        logger.info("No messages found in Supabase; sending empty report with headers.")
+
+    # Build human-readable conversation per user (group by email)
+    data_by_user: dict[str, dict] = {}
+    for row in rows:
+        email = (row.get("email") or "").strip()
+        name = (row.get("name") or "").strip()
+        session = row.get("session_id") or ""
+        role = row.get("role") or ""
+        content = row.get("content") or ""
+        ts = row.get("timestamp") or ""
+
+        key = f"{email}:{session}"
+        entry = data_by_user.setdefault(key, {"name": name, "email": email, "session_id": session, "messages": []})
+        entry["messages"].append({"role": role, "content": content, "timestamp": ts})
+
+    # Flatten into rows for Excel: name, email, session_id, conversation
+    excel_rows = []
+    for key, entry in data_by_user.items():
+        conv_lines = []
+        # sort by timestamp
+        msgs = sorted(entry["messages"], key=lambda m: m.get("timestamp"))
+        for m in msgs:
+            label = "User" if m.get("role") == "user" else "Assistant"
+            conv_lines.append(f"{label}: {m.get('content')}")
+        excel_rows.append({"name": entry.get("name"), "email": entry.get("email"), "session_id": entry.get("session_id"), "conversation": "\n".join(conv_lines)})
+
+    df = pd.DataFrame(excel_rows, columns=["name", "email", "session_id", "conversation"])
+    output = io.BytesIO()
+    df.to_excel(output, index=False, engine="openpyxl")
+    output.seek(0)
+
+    # Send email with attachment via SMTP if configured
+    smtp_host = os.getenv("SMTP_HOST")
+    smtp_port = int(os.getenv("SMTP_PORT", "0") or 0)
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_password = os.getenv("SMTP_PASSWORD")
+
+    if not smtp_host or not smtp_port or not smtp_user or not smtp_password:
+        logger.warning("SMTP not fully configured; cannot send daily report email. Configure SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASSWORD in .env")
+        return
+
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = f"Chat Conversations Report (Daily) - {now.strftime('%Y-%m-%d %H:%M:%S')} UTC"
+        msg["From"] = smtp_user
+        msg["To"] = recipient
+        msg.set_content("Attached is the latest chatbot conversation report in human-readable format (Name, Email, Session ID, Conversation).")
+        msg.add_attachment(output.read(), maintype="application", subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename=f"conversations_{now.strftime('%Y%m%d_%H%M%S')}.xlsx")
+
+        if smtp_port == 465:
+            server = smtplib.SMTP_SSL(smtp_host, smtp_port)
+        else:
+            server = smtplib.SMTP(smtp_host, smtp_port)
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+
+        server.login(smtp_user, smtp_password)
+        server.send_message(msg)
+        server.quit()
+        logger.info("Daily report emailed to %s", recipient)
+    except Exception:
+        logger.exception("Failed to send daily report email")
+
+
+# Start Supabase client and scheduler
+_scheduler: BackgroundScheduler | None = None
+
+def _start_daily_report_scheduler() -> None:
+    global _scheduler
+    _init_supabase_client()
+    # If already running, skip
+    if _scheduler:
+        return
+    _scheduler = BackgroundScheduler()
+    # run every 24 hours
+    _scheduler.add_job(
+        _generate_daily_report_and_send,
+        'interval',
+        hours=24,
+        id='chat_report_24_hours',
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+    _scheduler.start()
+    logger.info("Report scheduler started: every 24 hours")
 
 
 def _sanitize_header_value(value: str, *, max_chars: int = 700) -> str:
@@ -448,6 +800,21 @@ def _get_embedding_similarity_threshold() -> float:
     return max(0.0, min(threshold, 1.0))
 
 
+def _get_out_of_context_threshold() -> float:
+    raw_value = os.getenv("OUT_OF_CONTEXT_THRESHOLD", "0.08")
+    try:
+        threshold = float(raw_value)
+    except ValueError:
+        threshold = 0.08
+    return max(0.0, min(threshold, 1.0))
+
+
+def _is_out_of_context(retrieved_context: str, top_score: float) -> bool:
+    if not retrieved_context.strip():
+        return True
+    return top_score < _get_out_of_context_threshold()
+
+
 def _get_memory_turns() -> int:
     return int(os.getenv("CONVERSATION_MEMORY_TURNS", "6"))
 
@@ -568,7 +935,6 @@ def get_async_azure_openai_client() -> AsyncAzureOpenAI:
         azure_endpoint=_get_azure_openai_endpoint(),
         api_key=_get_azure_openai_api_key(),
     )
-
 
 
 @lru_cache(maxsize=1)
@@ -716,6 +1082,10 @@ async def _stream_answer_tokens_with_context(
     retrieved_context: str,
     top_score: float,
 ) -> AsyncGenerator[str, None]:
+    if _is_out_of_context(retrieved_context, top_score):
+        yield OUT_OF_CONTEXT_FALLBACK
+        return
+
     try:
         client = get_async_azure_openai_client()
         completion_stream = await client.chat.completions.create(
@@ -771,6 +1141,9 @@ async def _generate_answer(
     if retrieved_context is None or top_score is None:
         retrieved_context, top_score = _retrieve_context_and_score(normalized_query)
 
+    if _is_out_of_context(retrieved_context, top_score):
+        return OUT_OF_CONTEXT_FALLBACK
+
     try:
         return await _generate_completion_with_context(model_input, retrieved_context)
     except Exception as completion_error:
@@ -783,11 +1156,171 @@ async def health() -> dict:
     return {"status": "ok"}
 
 
+@app.get("/api/employees/")
+async def list_employees(active_only: bool = Query(default=False)) -> list[dict[str, Any]]:
+    if active_only:
+        return [employee for employee in _employees_seed if employee.get("active")]
+    return _employees_seed
+
+
+@app.post("/api/employees/register")
+async def register_employee(
+    name: str = Form(...),
+    employee_code: str = Form(default=""),
+    department: str = Form(default=""),
+    photos: list[UploadFile] = File(...),
+) -> dict[str, Any]:
+    if len(photos) < 5:
+        raise HTTPException(status_code=400, detail="At least 5 photos are required for registration.")
+
+    employee_id = _next_employee_id()
+    normalized_code = (employee_code or f"EMP{employee_id:04d}").strip()
+    employee_dir = EMPLOYEE_FACES_DIR / normalized_code
+    employee_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_photos = 0
+    for index, upload in enumerate(photos, start=1):
+        raw = await upload.read()
+        if not raw:
+            continue
+        extension = Path(upload.filename or "").suffix.lower()
+        if extension not in {".jpg", ".jpeg", ".png", ".webp"}:
+            continue
+        output_path = employee_dir / f"{index:02d}{extension}"
+        output_path.write_bytes(raw)
+        saved_photos += 1
+        await upload.close()
+
+    if saved_photos < 5:
+        raise HTTPException(
+            status_code=400,
+            detail="At least 5 valid image files (.jpg/.jpeg/.png/.webp) are required.",
+        )
+
+    employee_record: dict[str, Any] = {
+        "id": employee_id,
+        "name": name.strip(),
+        "employee_code": normalized_code,
+        "department": department.strip() or "Unknown",
+        "active": True,
+        "face_samples": saved_photos,
+    }
+    _employees_seed.append(employee_record)
+    return {"status": "success", "employee": employee_record}
+
+
+@app.get("/api/cameras/")
+async def list_cameras() -> list[dict[str, Any]]:
+    return _cameras_seed
+
+
+@app.post("/api/cameras/")
+async def create_camera(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    with _camera_lock:
+        new_camera = dict(payload)
+        new_camera["id"] = _next_camera_id()
+        new_camera.setdefault("camera_id", f"cam{new_camera['id']}")
+        new_camera.setdefault("name", f"CAM_{new_camera['id']:03d}")
+        new_camera.setdefault("location", "Unknown")
+        if "source" not in new_camera:
+            new_camera["source"] = new_camera.get("stream_source", "")
+        new_camera.setdefault("fps", 0.0)
+        new_camera.setdefault("people", 0)
+        new_camera.setdefault("status", "offline")
+        _cameras_seed.append(new_camera)
+        return new_camera
+
+
+@app.put("/api/cameras/{camera_ref}")
+async def update_camera(camera_ref: str, payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    with _camera_lock:
+        camera_index = _find_camera_index_by_ref(camera_ref)
+        if camera_index < 0:
+            raise HTTPException(status_code=404, detail="Camera not found")
+
+        updated_camera = dict(_cameras_seed[camera_index])
+        for key, value in payload.items():
+            if key != "id":
+                updated_camera[key] = value
+        _cameras_seed[camera_index] = updated_camera
+        return updated_camera
+
+
+@app.delete("/api/cameras/{camera_ref}")
+async def delete_camera(camera_ref: str) -> dict[str, Any]:
+    with _camera_lock:
+        camera_index = _find_camera_index_by_ref(camera_ref)
+        if camera_index < 0:
+            raise HTTPException(status_code=404, detail="Camera not found")
+        deleted_camera = _cameras_seed.pop(camera_index)
+        return {"status": "success", "deleted": deleted_camera}
+
+
+@app.post("/api/webrtc/{camera_ref}/offer")
+async def webrtc_offer(camera_ref: str, payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    camera = _find_camera(camera_ref)
+    if camera is None:
+        raise HTTPException(status_code=404, detail="Camera not found")
+
+    if not (RTCPeerConnection and RTCSessionDescription and av and np):
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "WebRTC runtime dependencies are missing. Install aiortc, av, and numpy "
+                "in backend virtualenv to enable live feed streaming."
+            ),
+        )
+
+    offer_sdp = str(payload.get("sdp", ""))
+    offer_type = str(payload.get("type", "offer"))
+    if not offer_sdp:
+        raise HTTPException(status_code=400, detail="Missing SDP offer")
+    if offer_type != "offer":
+        raise HTTPException(status_code=400, detail="Invalid SDP type; expected 'offer'")
+
+    peer = RTCPeerConnection()
+    camera_id = str(camera.get("camera_id", camera_ref))
+    _webrtc_connections.setdefault(camera_id, set()).add(peer)
+
+    @peer.on("connectionstatechange")
+    async def _on_connection_state_change() -> None:
+        if peer.connectionState in {"failed", "closed", "disconnected"}:
+            await peer.close()
+            _webrtc_connections.get(camera_id, set()).discard(peer)
+
+    peer.addTrack(_SyntheticCameraTrack(camera_label=camera_id))
+    await peer.setRemoteDescription(RTCSessionDescription(sdp=offer_sdp, type=offer_type))
+    answer = await peer.createAnswer()
+    await peer.setLocalDescription(answer)
+
+    # Give ICE gathering a short window so localDescription has candidates.
+    for _ in range(25):
+        if peer.iceGatheringState == "complete":
+            break
+        await asyncio.sleep(0.05)
+
+    local = peer.localDescription
+    if local is None:
+        raise HTTPException(status_code=500, detail="Failed to create WebRTC answer")
+
+    return {
+        "type": local.type,
+        "sdp": local.sdp,
+        "camera_id": camera_id,
+        "mode": "synthetic-video",
+    }
+
+
 @app.on_event("startup")
 async def _startup_ingestion() -> None:
     run_on_startup = os.getenv("AUTO_INGEST_DIGICOCO_KB_ON_STARTUP", "false").lower() == "true"
     if not run_on_startup:
         logger.info("Skipping DIGICoCo knowledge-base ingestion at startup for faster boot.")
+        # still start the daily report scheduler even if ingestion is skipped
+        try:
+            _start_daily_report_scheduler()
+        except Exception:
+            logger.exception("Failed to start daily report scheduler")
         return
 
     def _ingest_in_background() -> None:
@@ -797,12 +1330,18 @@ async def _startup_ingestion() -> None:
             logger.warning("Background startup ingestion failed: %s", startup_ingest_error)
 
     Thread(target=_ingest_in_background, daemon=True).start()
+    try:
+        _start_daily_report_scheduler()
+    except Exception:
+        logger.exception("Failed to start daily report scheduler")
 
 
 @app.post("/api/chat/text")
 async def text_chat(
     query: str = Form(...),
     session_id: str | None = Form(default=None),
+    x_user_name: str | None = Header(default=None),
+    x_user_email: str | None = Header(default=None),
 ) -> dict:
     try:
         normalized_query = _normalize_user_query(query)
@@ -817,6 +1356,15 @@ async def text_chat(
             top_score=top_score,
         )
         _save_conversation_turn(effective_session_id, normalized_query, answer)
+        # persist user and assistant messages to Supabase (if configured)
+        try:
+            # Ensure user and session rows exist, then persist messages
+            _supabase_upsert_user(name=x_user_name, email=x_user_email)
+            _supabase_upsert_session(session_id=effective_session_id, name=x_user_name, email=x_user_email)
+            _supabase_insert_message(x_user_name, x_user_email, effective_session_id, "user", normalized_query, datetime.utcnow())
+            _supabase_insert_message(x_user_name, x_user_email, effective_session_id, "assistant", answer, datetime.utcnow())
+        except Exception:
+            logger.exception("Failed to persist conversation to Supabase")
         _append_pipeline_log(
             session_id=effective_session_id,
             user_query=normalized_query,
@@ -856,6 +1404,8 @@ async def text_chat(
 async def text_chat_stream(
     query: str = Form(...),
     session_id: str | None = Form(default=None),
+    x_user_name: str | None = Header(default=None),
+    x_user_email: str | None = Header(default=None),
 ) -> StreamingResponse:
     normalized_query = _normalize_user_query(query)
     effective_session_id = _normalize_session_id(session_id)
@@ -888,6 +1438,15 @@ async def text_chat_stream(
 
 
             _save_conversation_turn(effective_session_id, normalized_query, final_answer)
+            # persist user and assistant messages to Supabase (if configured)
+            try:
+                _supabase_upsert_user(x_user_name, x_user_email)
+                _supabase_upsert_user(name=x_user_name, email=x_user_email)
+                _supabase_upsert_session(session_id=effective_session_id, name=x_user_name, email=x_user_email)
+                _supabase_insert_message(x_user_name, x_user_email, effective_session_id, "user", normalized_query, datetime.utcnow())
+                _supabase_insert_message(x_user_name, x_user_email, effective_session_id, "assistant", final_answer, datetime.utcnow())
+            except Exception:
+                logger.exception("Failed to persist streamed conversation to Supabase")
             _append_pipeline_log(
                 session_id=effective_session_id,
                 user_query=normalized_query,
@@ -977,10 +1536,51 @@ async def ingest_upload(
             os.remove(temp_file_path)
 
 
+@app.post('/api/session/register')
+async def register_session(payload: dict = Body(default_factory=dict)) -> dict:
+    """Register or update a session. Expects JSON: {"email": "..", "name": "..", "session_id": "optional"}.
+    Returns: {"session_id": "..."}
+    """
+    email = (payload.get('email') or '').strip()
+    name = (payload.get('name') or '').strip()
+    session_id = (payload.get('session_id') or '').strip() or f"s_{uuid.uuid4().hex}"
+
+    if not email:
+        raise HTTPException(status_code=400, detail='Missing email')
+
+    try:
+        logger.info("Session register called: session_id=%s email=%s supabase_client_set=%s", session_id, email, bool(_supabase_client))
+        _supabase_upsert_user(name=name, email=email)
+        _supabase_upsert_session(session_id=session_id, name=name, email=email)
+        logger.info("Session register completed: session_id=%s", session_id)
+        return {"session_id": session_id}
+    except Exception as error:
+        logger.exception('Session register failed')
+        raise HTTPException(status_code=500, detail='Failed to register session') from error
+
+
+@app.get('/api/session/{session_id}')
+async def get_session(session_id: str) -> dict:
+    session_id = (session_id or '').strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail='Missing session_id')
+    session = _supabase_get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail='Session not found')
+    return {
+        'session_id': session.get('session_id'),
+        'email': session.get('email'),
+        'name': session.get('name'),
+        'last_seen_at': session.get('last_seen_at'),
+    }
+
+
 @app.post("/api/chat/voice")
 async def voice_chat(
     audio: UploadFile = File(...),
     x_session_id: str | None = Header(default=None),
+    x_user_name: str | None = Header(default=None),
+    x_user_email: str | None = Header(default=None),
 ) -> Response:
     input_filename = audio.filename or "recording.webm"
 
@@ -1030,6 +1630,14 @@ async def voice_chat(
             top_score=top_score,
         )
         _save_conversation_turn(effective_session_id, user_text, bot_reply_text)
+        try:
+            _supabase_upsert_user(x_user_name, x_user_email)
+            _supabase_upsert_user(name=x_user_name, email=x_user_email)
+            _supabase_upsert_session(session_id=effective_session_id, name=x_user_name, email=x_user_email)
+            _supabase_insert_message(x_user_name, x_user_email, effective_session_id, "user", user_text, datetime.utcnow())
+            _supabase_insert_message(x_user_name, x_user_email, effective_session_id, "assistant", bot_reply_text, datetime.utcnow())
+        except Exception:
+            logger.exception("Failed to persist voice conversation to Supabase")
         _append_pipeline_log(
             session_id=effective_session_id,
             user_query=user_text,
