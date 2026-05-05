@@ -486,8 +486,15 @@ function App() {
       }
 
       setIsRecording(true);
-    } catch {
-      alert('Please allow microphone access to use voice features.');
+    } catch (error) {
+      console.error('Microphone access error:', error);
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: 'bot',
+          text: 'Microphone access is blocked. If you are viewing this on a website, the website needs to allow microphone permissions in its iframe settings.'
+        }
+      ]);
     }
   };
 
@@ -543,13 +550,13 @@ function App() {
 
     setIsLoading(true);
     setIsVoiceRequestInFlight(true);
-    
+
     const audioFile = new File([audioBlob], 'recording.webm', { type: chunkType });
     const formData = new FormData();
     formData.append('audio', audioFile);
 
     let finalUserText = liveVoiceTranscriptRef.current.trim();
-    
+
     if (!finalUserText) {
       try {
         const transcribeRes = await fetch(`${API_BASE_URL}/api/chat/transcribe`, {
