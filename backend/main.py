@@ -1554,23 +1554,17 @@ async def get_session(session_id: str) -> dict:
     }
 
 
-@app.post("/api/chat/voice")
-async def voice_chat(
+@app.post("/api/chat/transcribe")
+async def transcribe_audio(
     audio: UploadFile = File(...),
-    x_session_id: str | None = Header(default=None),
-    x_user_name: str | None = Header(default=None),
-    x_user_email: str | None = Header(default=None),
-) -> Response:
-    input_filename = audio.filename or "recording.webm"
-
+) -> dict:
     try:
         groq_client = get_groq_client()
         audio_bytes = await audio.read()
-
         transcription_model = _get_transcription_model()
         try:
             transcription = groq_client.audio.transcriptions.create(
-                file=(input_filename, audio_bytes),
+                file=(audio.filename or "recording.webm", audio_bytes),
                 model=transcription_model,
                 prompt="The user is asking a question.",
                 response_format="json",
@@ -1580,24 +1574,70 @@ async def voice_chat(
                 "GROQ_TRANSCRIPTION_MODEL" not in os.environ
                 and transcription_model != "whisper-large-v3-turbo"
             )
-
             if not should_retry_with_turbo:
                 raise
-
-            logger.warning(
-                "Primary transcription model failed (%s). Retrying with whisper-large-v3-turbo.",
-                primary_error,
-            )
             transcription = groq_client.audio.transcriptions.create(
-                file=(input_filename, audio_bytes),
+                file=(audio.filename or "recording.webm", audio_bytes),
                 model="whisper-large-v3-turbo",
                 prompt="The user is asking a question.",
                 response_format="json",
             )
+        return {"text": (transcription.text or "").strip()}
+    except Exception as e:
+        logger.exception("Transcription failed")
+        raise HTTPException(status_code=500, detail=str(e))
 
-        user_text = _normalize_user_query((transcription.text or "").strip())
+@app.post("/api/chat/voice")
+async def voice_chat(
+    audio: UploadFile | None = File(None),
+    query: str | None = Form(None),
+    x_session_id: str | None = Header(default=None),
+    x_user_name: str | None = Header(default=None),
+    x_user_email: str | None = Header(default=None),
+) -> Response:
+    input_filename = audio.filename if audio else "recording.webm"
+
+    try:
+        if query and query.strip():
+            user_text = _normalize_user_query(query.strip())
+        elif audio:
+            groq_client = get_groq_client()
+            audio_bytes = await audio.read()
+
+            transcription_model = _get_transcription_model()
+            try:
+                transcription = groq_client.audio.transcriptions.create(
+                    file=(input_filename, audio_bytes),
+                    model=transcription_model,
+                    prompt="The user is asking a question.",
+                    response_format="json",
+                )
+            except Exception as primary_error:
+                should_retry_with_turbo = (
+                    "GROQ_TRANSCRIPTION_MODEL" not in os.environ
+                    and transcription_model != "whisper-large-v3-turbo"
+                )
+
+                if not should_retry_with_turbo:
+                    raise
+
+                logger.warning(
+                    "Primary transcription model failed (%s). Retrying with whisper-large-v3-turbo.",
+                    primary_error,
+                )
+                transcription = groq_client.audio.transcriptions.create(
+                    file=(input_filename, audio_bytes),
+                    model="whisper-large-v3-turbo",
+                    prompt="The user is asking a question.",
+                    response_format="json",
+                )
+
+            user_text = _normalize_user_query((transcription.text or "").strip())
+        else:
+            raise HTTPException(status_code=400, detail="Must provide audio or query.")
+
         if not user_text:
-            raise HTTPException(status_code=400, detail="Could not transcribe user audio.")
+            raise HTTPException(status_code=400, detail="Could not extract user text.")
 
         effective_session_id = _normalize_session_id(x_session_id)
         model_input = _build_model_input(effective_session_id, user_text)
@@ -1667,7 +1707,8 @@ async def voice_chat(
             ),
         ) from error
     finally:
-        await audio.close()
+        if audio:
+            await audio.close()
 
 
 @app.get("/api/chat/last")

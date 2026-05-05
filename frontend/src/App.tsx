@@ -47,14 +47,14 @@ const SESSION_STORAGE_KEY = 'chatbot_session_id';
 
 const ChatBotIcon = ({ className }: { className?: string }) => (
   <svg className={className} viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
-    <rect x="20" y="30" width="160" height="120" rx="20" fill="var(--vtl-primary)"/>
-    <polygon points="60,150 80,150 65,170" fill="var(--vtl-primary)"/>
-    <rect x="50" y="50" width="100" height="80" rx="15" fill="#FFFFFF"/>
-    <circle cx="80" cy="85" r="8" fill="var(--vtl-primary)"/>
-    <circle cx="120" cy="85" r="8" fill="var(--vtl-primary)"/>
-    <rect x="75" y="105" width="50" height="8" rx="4" fill="var(--vtl-primary)"/>
-    <line x1="100" y1="50" x2="100" y2="30" stroke="#FFFFFF" strokeWidth="4"/>
-    <circle cx="100" cy="25" r="5" fill="#FFFFFF"/>
+    <rect x="20" y="30" width="160" height="120" rx="20" fill="var(--vtl-primary)" />
+    <polygon points="60,150 80,150 65,170" fill="var(--vtl-primary)" />
+    <rect x="50" y="50" width="100" height="80" rx="15" fill="#FFFFFF" />
+    <circle cx="80" cy="85" r="8" fill="var(--vtl-primary)" />
+    <circle cx="120" cy="85" r="8" fill="var(--vtl-primary)" />
+    <rect x="75" y="105" width="50" height="8" rx="4" fill="var(--vtl-primary)" />
+    <line x1="100" y1="50" x2="100" y2="30" stroke="#FFFFFF" strokeWidth="4" />
+    <circle cx="100" cy="25" r="5" fill="#FFFFFF" />
   </svg>
 );
 
@@ -543,24 +543,49 @@ function App() {
 
     setIsLoading(true);
     setIsVoiceRequestInFlight(true);
-    if (liveVoiceTranscriptRef.current.trim()) {
-      setMessages((prev) => {
-        const userIndex = prev.length;
-        const botIndex = prev.length + 1;
-        pendingVoiceTurnRef.current = { userIndex, botIndex };
-        return [
-          ...prev,
-          { role: 'user', text: liveVoiceTranscriptRef.current.trim(), isAudio: true },
-          { role: 'bot', text: '', isAudio: true },
-        ];
-      });
-    }
+    
     const audioFile = new File([audioBlob], 'recording.webm', { type: chunkType });
-
     const formData = new FormData();
     formData.append('audio', audioFile);
 
+    let finalUserText = liveVoiceTranscriptRef.current.trim();
+    
+    if (!finalUserText) {
+      try {
+        const transcribeRes = await fetch(`${API_BASE_URL}/api/chat/transcribe`, {
+          method: 'POST',
+          body: formData,
+        });
+        if (transcribeRes.ok) {
+          const transcribeData = await transcribeRes.json();
+          finalUserText = transcribeData.text;
+        }
+      } catch (e) {
+        console.error("Transcription failed", e);
+      }
+    }
+
+    finalUserText = finalUserText || "Voice Message";
+
+    setMessages((prev) => {
+      const userIndex = prev.length;
+      const botIndex = prev.length + 1;
+      pendingVoiceTurnRef.current = { userIndex, botIndex };
+      return [
+        ...prev,
+        { role: 'user', text: finalUserText, isAudio: true },
+        { role: 'bot', text: '', isAudio: true },
+      ];
+    });
+
     try {
+      const voiceFormData = new FormData();
+      if (finalUserText && finalUserText !== "Voice Message") {
+        voiceFormData.append('query', finalUserText);
+      } else {
+        voiceFormData.append('audio', audioFile);
+      }
+
       const response = await fetch(`${API_BASE_URL}/api/chat/voice`, {
         method: 'POST',
         headers: {
@@ -568,7 +593,7 @@ function App() {
           ...(userEmail ? { 'X-User-Email': userEmail } : {}),
           ...(userName ? { 'X-User-Name': userName } : {}),
         },
-        body: formData,
+        body: voiceFormData,
       });
 
       if (!response.ok) {
@@ -646,13 +671,11 @@ function App() {
     <>
       <button
         onClick={() => setIsOpen(!isOpen)}
-        className={`fixed z-50 transition-transform hover:scale-105 flex items-center justify-center ${
-          isOpen ? 'top-3 right-3 sm:top-auto sm:bottom-6 sm:right-6' : 'bottom-4 right-4 sm:bottom-6 sm:right-6'
-        } ${
-          !isOpen
+        className={`fixed z-50 transition-transform hover:scale-105 flex items-center justify-center ${isOpen ? 'top-3 right-3 sm:top-auto sm:bottom-6 sm:right-6' : 'bottom-4 right-4 sm:bottom-6 sm:right-6'
+          } ${!isOpen
             ? 'w-16 h-16 sm:w-[110px] sm:h-[110px] rounded-full bg-transparent shadow-none overflow-hidden p-0'
             : 'p-3 sm:p-4 bg-[var(--vtl-primary)] text-white rounded-full shadow-2xl hover:brightness-95'
-        }`}
+          }`}
       >
         {isOpen ? (
           <X className="w-5 h-5 sm:w-6 sm:h-6" />
@@ -674,9 +697,8 @@ function App() {
             {messages.map((msg, idx) => (
               <div key={`${msg.role}-${idx}`} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                 <div
-                  className={`p-3 rounded-2xl text-sm max-w-[90%] sm:max-w-[85%] shadow-sm bg-[var(--vtl-panel)] border border-[var(--vtl-border)] text-[var(--vtl-text)] ${
-                    msg.role === 'user' ? 'rounded-br-none' : 'rounded-bl-none'
-                  }`}
+                  className={`p-3 rounded-2xl text-sm max-w-[90%] sm:max-w-[85%] shadow-sm bg-[var(--vtl-panel)] border border-[var(--vtl-border)] text-[var(--vtl-text)] ${msg.role === 'user' ? 'rounded-br-none' : 'rounded-bl-none'
+                    }`}
                 >
                   {msg.isAudio && <span className="text-xs opacity-75 block mb-1">🎤 Voice</span>}
                   {msg.role === 'bot' && msg.text.trim().length === 0 && isLoading && idx === messages.length - 1 ? (
@@ -709,37 +731,36 @@ function App() {
             </div>
 
             <div className="flex items-center gap-2">
-            <button
-              onClick={handleVoiceButtonClick}
-              title={isRecording ? 'Tap to stop and send voice message' : 'Tap to start recording voice message'}
-              className={`p-2 sm:p-2.5 rounded-full flex-shrink-0 ${
-                isRecording
+              <button
+                onClick={handleVoiceButtonClick}
+                title={isRecording ? 'Tap to stop and send voice message' : 'Tap to start recording voice message'}
+                className={`p-2 sm:p-2.5 rounded-full flex-shrink-0 ${isRecording
                   ? 'bg-red-500 text-white animate-pulse'
                   : 'bg-[var(--vtl-chip-bg)] text-[var(--vtl-primary)] hover:bg-[var(--vtl-chip-hover)] disabled:opacity-50 disabled:cursor-not-allowed'
-              }`}
-              disabled={isLoading || leadStep !== 'chat'}
-            >
-              <Mic className="w-4 h-4 sm:w-5 sm:h-5" />
-            </button>
-
-            <form onSubmit={handleTextSubmit} className="flex-1 flex gap-2">
-              <input
-                type="text"
-                value={inputText}
-                onChange={(e) => setInputText(e.target.value)}
-                placeholder={leadStep === 'email' ? 'Email address' : leadStep === 'name' ? 'Your name' : 'Message...'}
-                className="flex-1 min-w-0 px-3 sm:px-4 py-2 text-sm rounded-full bg-[var(--vtl-chip-bg)] text-[var(--vtl-text)] border border-transparent focus:bg-white focus:border-[var(--vtl-secondary)] outline-none"
-                disabled={isRecording || isLoading}
-              />
-              <button
-                type="submit"
-                title={leadStep === 'chat' ? 'Send message' : 'Continue'}
-                disabled={!inputText.trim() || isRecording || isLoading}
-                className="p-2 sm:p-2.5 bg-[var(--vtl-primary)] text-white rounded-full hover:brightness-95 disabled:opacity-50"
+                  }`}
+                disabled={isLoading || leadStep !== 'chat'}
               >
-                <Send className="w-4 h-4" />
+                <Mic className="w-4 h-4 sm:w-5 sm:h-5" />
               </button>
-            </form>
+
+              <form onSubmit={handleTextSubmit} className="flex-1 flex gap-2">
+                <input
+                  type="text"
+                  value={inputText}
+                  onChange={(e) => setInputText(e.target.value)}
+                  placeholder={leadStep === 'email' ? 'Email address' : leadStep === 'name' ? 'Your name' : 'Message...'}
+                  className="flex-1 min-w-0 px-3 sm:px-4 py-2 text-sm rounded-full bg-[var(--vtl-chip-bg)] text-[var(--vtl-text)] border border-transparent focus:bg-white focus:border-[var(--vtl-secondary)] outline-none"
+                  disabled={isRecording || isLoading}
+                />
+                <button
+                  type="submit"
+                  title={leadStep === 'chat' ? 'Send message' : 'Continue'}
+                  disabled={!inputText.trim() || isRecording || isLoading}
+                  className="p-2 sm:p-2.5 bg-[var(--vtl-primary)] text-white rounded-full hover:brightness-95 disabled:opacity-50"
+                >
+                  <Send className="w-4 h-4" />
+                </button>
+              </form>
             </div>
           </div>
         </div>
