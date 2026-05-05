@@ -1,35 +1,20 @@
 {
-    "$schema": "https://openapi.vercel.sh/vercel.json",
-    "experimentalServices": {
-      "frontend": {
-        "entrypoint": "frontend",
-        "routePrefix": "/",
-        "framework": "vite"
-      },
-      "backend": {
-        "entrypoint": "backend",
-        "routePrefix": "/backend"
-      }
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "experimentalServices": {
+    "frontend": {
+      "entrypoint": "frontend",
+      "routePrefix": "/",
+      "framework": "vite"
     },
-    "crons": [
-      {
-        "path": "/backend/api/cron/daily-report",
-        "schedule": "0 0 * * *"
-      }
-    ],
-    "headers": [
-      {
-        "source": "/(.*)",
-        "headers": [
-          {
-            "key": "Permissions-Policy",
-            "value": "microphone=*, autoplay=*"
-          },
-          {
-            "key": "Content-Security-Policy",
-            "value": "frame-ancestors 'self' https://sites.google.com"
-          }
-        ]
-      }
-    ]
-  }
+    "backend": {
+      "entrypoint": "backend",
+      "routePrefix": "/backend"
+    }
+  },
+  "crons": [
+    {
+      "path": "/backend/api/cron/daily-report",
+      "schedule": "0 0 * * *"
+    }
+  ]
+}
