@@ -741,22 +741,7 @@ function App() {
           </div>
 
           <div className="p-3 bg-[var(--vtl-panel)] border-t border-[var(--vtl-border)]">
-            <div className={`text-xs mb-2 ${isRecording ? 'text-red-500 font-medium' : 'text-[var(--vtl-muted)]'}`}>
-              {voiceHintText}
-            </div>
-
             <div className="flex items-center gap-2">
-              <button
-                onClick={handleVoiceButtonClick}
-                title={isRecording ? 'Tap to stop and send voice message' : 'Tap to start recording voice message'}
-                className={`p-2 sm:p-2.5 rounded-full flex-shrink-0 ${isRecording
-                  ? 'bg-red-500 text-white animate-pulse'
-                  : 'bg-[var(--vtl-chip-bg)] text-[var(--vtl-primary)] hover:bg-[var(--vtl-chip-hover)] disabled:opacity-50 disabled:cursor-not-allowed'
-                  }`}
-                disabled={isLoading || leadStep !== 'chat'}
-              >
-                <Mic className="w-4 h-4 sm:w-5 sm:h-5" />
-              </button>
 
               <form onSubmit={handleTextSubmit} className="flex-1 flex gap-2">
                 <input
