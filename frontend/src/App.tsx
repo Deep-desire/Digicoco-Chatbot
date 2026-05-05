@@ -46,16 +46,7 @@ const API_BASE_URL = resolveApiBaseUrl();
 const SESSION_STORAGE_KEY = 'chatbot_session_id';
 
 const ChatBotIcon = ({ className }: { className?: string }) => (
-  <svg className={className} viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
-    <rect x="20" y="30" width="160" height="120" rx="20" fill="var(--vtl-primary)" />
-    <polygon points="60,150 80,150 65,170" fill="var(--vtl-primary)" />
-    <rect x="50" y="50" width="100" height="80" rx="15" fill="#FFFFFF" />
-    <circle cx="80" cy="85" r="8" fill="var(--vtl-primary)" />
-    <circle cx="120" cy="85" r="8" fill="var(--vtl-primary)" />
-    <rect x="75" y="105" width="50" height="8" rx="4" fill="var(--vtl-primary)" />
-    <line x1="100" y1="50" x2="100" y2="30" stroke="#FFFFFF" strokeWidth="4" />
-    <circle cx="100" cy="25" r="5" fill="#FFFFFF" />
-  </svg>
+  <img src="/digicoco.png" alt="DIGICoCo ChatBot" className={className} />
 );
 
 const decodeHeaderValue = (value: string | null): string => {
@@ -127,6 +118,15 @@ function App() {
   const speechRecognitionRef = useRef<BrowserSpeechRecognition | null>(null);
   const liveVoiceTranscriptRef = useRef('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const currentAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  const stopAudio = () => {
+    if (currentAudioRef.current) {
+      currentAudioRef.current.pause();
+      currentAudioRef.current.currentTime = 0;
+      currentAudioRef.current = null;
+    }
+  };
 
   useEffect(() => {
     const storedSessionId = localStorage.getItem(SESSION_STORAGE_KEY)?.trim();
@@ -203,6 +203,7 @@ function App() {
   };
 
   const submitUserMessage = async (rawMessage: string) => {
+    stopAudio();
     if (!rawMessage.trim()) {
       return;
     }
@@ -423,6 +424,7 @@ function App() {
   };
 
   const startRecording = async () => {
+    stopAudio();
     if (isLoading || isRecording || leadStep !== 'chat') {
       return;
     }
@@ -643,12 +645,18 @@ function App() {
       if (audioResponseBlob.size > 0) {
         const audioUrl = URL.createObjectURL(audioResponseBlob);
         const audio = new Audio(audioUrl);
+        currentAudioRef.current = audio;
         try {
           await audio.play();
         } catch {
           // Keep text response visible even when autoplay is blocked.
         }
-        audio.onended = () => URL.revokeObjectURL(audioUrl);
+        audio.onended = () => {
+          URL.revokeObjectURL(audioUrl);
+          if (currentAudioRef.current === audio) {
+            currentAudioRef.current = null;
+          }
+        };
       }
     } catch {
       updatePendingVoiceTurn('Voice Message', 'Sorry, failed to process audio.');
@@ -680,14 +688,14 @@ function App() {
         onClick={() => setIsOpen(!isOpen)}
         className={`fixed z-50 transition-transform hover:scale-105 flex items-center justify-center ${isOpen ? 'top-3 right-3 sm:top-auto sm:bottom-6 sm:right-6' : 'bottom-4 right-4 sm:bottom-6 sm:right-6'
           } ${!isOpen
-            ? 'w-16 h-16 sm:w-[110px] sm:h-[110px] rounded-full bg-transparent shadow-none overflow-hidden p-0'
+            ? 'w-16 h-16 sm:w-[110px] sm:h-[110px] bg-transparent shadow-none p-0'
             : 'p-3 sm:p-4 bg-[var(--vtl-primary)] text-white rounded-full shadow-2xl hover:brightness-95'
           }`}
       >
         {isOpen ? (
           <X className="w-5 h-5 sm:w-6 sm:h-6" />
         ) : (
-          <ChatBotIcon className="w-full h-full object-contain rounded-full" />
+          <ChatBotIcon className="w-full h-full object-contain drop-shadow-lg" />
         )}
       </button>
 

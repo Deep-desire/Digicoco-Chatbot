@@ -1670,7 +1670,12 @@ async def voice_chat(
         )
 
 
-        communicate = edge_tts.Communicate(bot_reply_text, _get_tts_voice())
+        import re
+        tts_text = re.sub(r'#+\s+', '', bot_reply_text)
+        tts_text = re.sub(r'[*_~`]', '', tts_text)
+        tts_text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', tts_text)
+        
+        communicate = edge_tts.Communicate(tts_text.strip(), _get_tts_voice())
         output_audio_bytes = bytearray()
         async for chunk in communicate.stream():
             if chunk.get("type") == "audio":
