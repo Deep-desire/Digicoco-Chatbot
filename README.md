@@ -1,4 +1,4 @@
-# Hybrid Voice + Text RAG Chatbot
+ # Hybrid Voice + Text RAG Chatbot
 
 Embeddable conversational widget with text + voice, powered by RAG.
 
